@@ -28,7 +28,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout,
                              QLineEdit, QFormLayout, QMessageBox, QListWidget, 
                              QInputDialog, QComboBox)
 from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QPoint
-from PyQt6.QtGui import QFont, QPainter, QColor, QPen
+from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QIcon
+
+# Settings are written by the app, so they cannot live next to an installed
+# executable. app_paths resolves them to the user's own data directory in a
+# packaged build, and next to the source when running from a checkout.
+from app_paths import CONFIG_PATH, PHRASES_PATH, window_icon_path
 
 # --- DEFAULT MATRIX PHRASES ---
 DEFAULT_PHRASES_LIST = [
@@ -46,9 +51,9 @@ FACIAL_EXPRESSION_OPTIONS = ["clench", "furrow", "smile", "surprise", "smirkLeft
 
 
 def load_phrases_from_file():
-    if os.path.exists("phrases.json"):
+    if os.path.exists(PHRASES_PATH):
         try:
-            with open("phrases.json", "r") as f:
+            with open(PHRASES_PATH, "r") as f:
                 phrases = json.load(f)
                 if isinstance(phrases, list) and len(phrases) > 0:
                     return phrases
@@ -196,7 +201,7 @@ class PhraseManagerDialog(QDialog):
         if "FLIP OVER" not in phrases:
             phrases.append("FLIP OVER")
         try:
-            with open("phrases.json", "w") as f:
+            with open(PHRASES_PATH, "w") as f:
                 json.dump(phrases, f, indent=4)
             self.accept()
         except Exception as e:
@@ -307,9 +312,9 @@ class CortexCredentialsDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def load_existing_config(self):
-        if os.path.exists("config.json"):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open("config.json", "r") as f:
+                with open(CONFIG_PATH, "r") as f:
                     cfg = json.load(f)
                     self.client_id_input.setText(cfg.get("cortex_client_id", cfg.get("client_id", "")))
                     self.client_secret_input.setText(cfg.get("cortex_client_secret", cfg.get("client_secret", "")))
@@ -349,7 +354,7 @@ class CortexCredentialsDialog(QDialog):
         }
 
         try:
-            with open("config.json", "w") as f:
+            with open(CONFIG_PATH, "w") as f:
                 json.dump(cfg, f, indent=4)
             self.accept()
         except Exception as e:
@@ -387,9 +392,9 @@ class EmotivCortexWorker(QThread):
         client_secret = ""
         profile_name = ""
         
-        if os.path.exists("config.json"):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open("config.json", "r") as f:
+                with open(CONFIG_PATH, "r") as f:
                     config = json.load(f)
                     client_id = config.get("cortex_client_id", config.get("client_id", ""))
                     client_secret = config.get("cortex_client_secret", config.get("client_secret", ""))
@@ -594,9 +599,9 @@ class BCICommunicationBoard(QMainWindow):
         self.init_include_mental = True
         self.init_include_facial = True
 
-        if os.path.exists("config.json"):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open("config.json", "r") as f:
+                with open(CONFIG_PATH, "r") as f:
                     cfg = json.load(f)
                     self.select_thought = cfg.get("select_thought", "push")
                     self.select_facial = cfg.get("select_facial", "clench")
@@ -636,7 +641,7 @@ class BCICommunicationBoard(QMainWindow):
         self.cortex_thread.start()
 
     def check_credentials_on_launch(self):
-        if not os.path.exists("config.json"):
+        if not os.path.exists(CONFIG_PATH):
             self.open_credentials_dialog()
 
     def open_credentials_dialog(self):
@@ -1038,13 +1043,13 @@ class BCICommunicationBoard(QMainWindow):
             self.controls_label.setText("ALL BCI OVERRIDES DISABLED")
 
         # Persist checkbox state directly to config.json
-        if os.path.exists("config.json"):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open("config.json", "r") as f:
+                with open(CONFIG_PATH, "r") as f:
                     cfg = json.load(f)
                 cfg["include_mental_commands"] = m_on
                 cfg["include_facial_expressions"] = f_on
-                with open("config.json", "w") as f:
+                with open(CONFIG_PATH, "w") as f:
                     json.dump(cfg, f, indent=4)
             except Exception:
                 pass
@@ -1479,8 +1484,33 @@ class BCICommunicationBoard(QMainWindow):
                 
         self.display_box.setText(f"Composed Message: {self.composed_text}")
 
+def apply_app_icon(app):
+    """Put the app's own mark on the window, the Dock and the taskbar.
+
+    The executable carries an icon of its own, which is what Explorer and the
+    Start menu read, but Qt draws the title bar and the macOS Dock from
+    setWindowIcon and would otherwise show a default.
+    """
+    if os.name == "nt":
+        # Windows groups taskbar buttons by Application User Model ID, and a
+        # process that does not set one inherits the host interpreter's. Without
+        # this, a source run shows Python's icon no matter what Qt is told.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "com.emotiv.scanningboard")
+        except Exception:
+            # Cosmetic only, and shell32 is not worth failing a launch over.
+            pass
+
+    icon = window_icon_path()
+    if icon:
+        app.setWindowIcon(QIcon(icon))
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    apply_app_icon(app)
     window = BCICommunicationBoard()
     window.showMaximized()
     sys.exit(app.exec())

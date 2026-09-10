@@ -1,0 +1,21 @@
+# Runtime dependencies for the scanning board.
+#
+#   pip install -r requirements.txt
+#
+# Pinned where a version has actually been built and run on CI; left open where
+# any current release works, so security updates arrive without a code change.
+
+# UI.
+PyQt6
+
+# Offline text to speech. Pulls its own platform backend: comtypes + pywin32 on
+# Windows (SAPI5), pyobjc on macOS (NSSpeechSynthesizer). Both are declared by
+# pyttsx3 itself, so pip resolves them per platform.
+pyttsx3
+
+# Cortex transport. cortex.py opens wss://localhost:6868 with this.
+websocket-client==1.9.0
+
+# cortex.py imports pydispatch at module scope on every platform, so this is not
+# optional and not macOS-only.
+python-dispatch==0.2.3

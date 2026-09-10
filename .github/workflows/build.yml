@@ -1,0 +1,159 @@
+name: Build desktop app
+
+# Builds unsigned macOS and Windows installers. Run it from the Actions tab, or
+# push a v* tag to also attach the installers to a GitHub release.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    # Creating the release for a v* tag writes to the repository. Without this
+    # the token is read-only and the attach step fails with
+    # "Resource not accessible by integration" (403).
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macOS (Apple Silicon)
+            artifact: EMOTIV-Scanning-Board-macos-arm64
+            package: "*.dmg"
+          - os: windows-latest
+            label: Windows (x64)
+            artifact: EMOTIV-Scanning-Board-windows-x64
+            package: "*-setup.exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 rather than the newest: PyQt6, pyobjc and pywin32 all ship
+          # wheels for it, so neither runner has to compile anything.
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build icons
+        # Pillow is a build-time dependency only -- the spec excludes PIL from
+        # the bundle -- so it is installed here rather than in requirements.txt.
+        # On macOS this also produces the .icns via iconutil; on Windows that
+        # step no-ops and only the .ico is written.
+        run: |
+          python -m pip install pillow
+          python packaging/make_icon.py
+
+      - name: Build
+        run: pyinstaller packaging/BCIScanningBoard.spec --noconfirm
+
+      # ---------------------------------------------------------------- macOS
+      - name: Package macOS disk image
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dmg
+          cp -R "dist/EMOTIV Scanning Board.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "EMOTIV Scanning Board" \
+            -srcfolder dmg -ov -format UDZO \
+            "EMOTIV-Scanning-Board-macos-arm64.dmg"
+
+      - name: Check the macOS bundle actually launches
+        if: runner.os == 'macOS'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          # There is no headless mode, so this only proves the bundle starts and
+          # stays up -- not that the UI rendered, and not that speech works:
+          # pyttsx3 is imported lazily at the first spoken phrase, so a missing
+          # speech driver survives this check. It catches missing imports and
+          # broken bundling, which is what these builds get wrong.
+          "dist/EMOTIV Scanning Board.app/Contents/MacOS/EMOTIV Scanning Board" &
+          PID=$!
+          sleep 25
+          if kill -0 $PID 2>/dev/null; then
+            echo "bundle still running after 25s"
+            kill $PID
+          else
+            echo "bundle exited early — build is broken"
+            exit 1
+          fi
+
+      # -------------------------------------------------------------- Windows
+      - name: Check the Windows bundle actually launches
+        if: runner.os == 'Windows'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $exe = "dist/EMOTIV Scanning Board/EMOTIV Scanning Board.exe"
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 25
+          if ($p.HasExited) {
+            Write-Error "bundle exited early (code $($p.ExitCode)) — build is broken"
+            exit 1
+          }
+          Write-Host "bundle still running after 25s"
+          Stop-Process -Id $p.Id -Force
+        shell: pwsh
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: |
+          # The tag without its leading v, so the installer carries a real
+          # version; a manual run has no tag and falls back to 0.0.0.
+          $version = "0.0.0"
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $version = $env:GITHUB_REF -replace "^refs/tags/v", ""
+          }
+          Write-Host "building installer for version $version"
+
+          # Inno Setup is on the windows runner image, but the path has moved
+          # between image versions -- look for it rather than hard-coding one,
+          # and install it if a future image drops it entirely.
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue |
+                  Select-Object -ExpandProperty Source
+          if (-not $iscc) {
+            $iscc = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) {
+            Write-Host "Inno Setup not on the image; installing it"
+            choco install innosetup --no-progress -y
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          Write-Host "using $iscc"
+
+          & $iscc "/DAppVersion=$version" packaging/BCIScanningBoard.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Get-ChildItem *-setup.exe | ForEach-Object {
+            Write-Host ("{0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB))
+          }
+        shell: pwsh
+
+      # --------------------------------------------------------------- Upload
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.package }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.package }}
+          body: |
+            Unsigned builds — see the README for how to open them past
+            Gatekeeper (macOS) and SmartScreen (Windows).

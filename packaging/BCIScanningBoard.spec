@@ -59,7 +59,7 @@ a = Analysis(
     binaries=[],
     datas=datas,
     # cortex.py is imported inside a method, and pydispatch is its dependency.
-    hiddenimports=["cortex", "pydispatch", "websocket"] + tts_hidden,
+    hiddenimports=["cortex", "devices", "i18n", "pydispatch", "websocket"] + tts_hidden,
     hookspath=[],
     runtime_hooks=[],
     excludes=excludes,

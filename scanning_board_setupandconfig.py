@@ -1,9 +1,10 @@
 ### ---------------------------------------------------------------------------------- ###
-# FINAL VERSION: Single-Switch Scanning Board (Diagnostics Mode) + Config File Integration
-# Author: Jordan Labio
-# Date: 2026-07-21
-# Description: This is the final version of the BCI Scanning Board but adds a configuration file integration feature, removing the need for a config.json file. 
-#               
+# EMOTIV BCI Assistive Communication System
+# Original author: Jordan Labio
+#
+# A row/column scanning communication board driven by mental commands and
+# facial EMG, with text-to-speech output.
+#
 #               Version History:
 #               2026-07-23
                 # - Added CortexCredentialsDialog class, which acts as a configurable settings file dialog for entering EMOTIV Cortex API credentials and Profile Name.
@@ -15,6 +16,13 @@
 #               2026-07-29
                 # - Removed the strict warning requiring Client ID and Client Secret to be filled in. Users can leave these blank if your application relies on cloud licensing, auto-discovery, or first-party pre-approved credentials.
                 # - Added the "Include Mental Commands" and "Include Facial Expressions" checkboxes directly into the ⚙️ API Settings dialog.
+#               2026-09-28
+                # - Headset picker: the app no longer connects to whichever headset answered first. Screen 1 lists every headset Cortex reports and the caregiver chooses.
+                # - Any EMOTIV headset: the sensor map is built from the channel names Cortex returns, so Insight (5), EPOC X (14) and MN8 (2) all draw correctly.
+                # - MN8 has no facial expression stream, so facial input is disabled and explained rather than silently never firing.
+                # - Contact and EEG quality are now monitored during a session, not only before it, and shown on the board itself.
+                # - Chinese translation (interface and the phrase board), switchable at any time.
+                # - Stream parsing moved onto Cortex's own events instead of guessing array offsets out of raw WebSocket frames.
 ### ---------------------------------------------------------------------------------- ###
 
 
@@ -22,11 +30,12 @@ import sys
 import json
 import os
 import time
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, 
-                             QLabel, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QStackedWidget, QCheckBox, QSlider, QDialog, 
-                             QLineEdit, QFormLayout, QMessageBox, QListWidget, 
-                             QInputDialog, QComboBox)
+import threading
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout,
+                             QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QStackedWidget, QCheckBox, QSlider, QDialog,
+                             QLineEdit, QFormLayout, QMessageBox, QListWidget,
+                             QInputDialog, QComboBox, QScrollArea, QFrame)
 from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QPoint
 from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QIcon
 
@@ -35,7 +44,14 @@ from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QIcon
 # packaged build, and next to the source when running from a checkout.
 from app_paths import CONFIG_PATH, PHRASES_PATH, window_icon_path
 
+import devices
+import i18n
+from i18n import t
+
 # --- DEFAULT MATRIX PHRASES ---
+# These are TOKENS, not labels. What appears on the button is i18n.cell(token),
+# which is how the same board speaks English or Chinese without the scanning
+# logic knowing anything about language.
 DEFAULT_PHRASES_LIST = [
     "I HAVE TO TELL YOU SOMETHING", "I LOVE YOU", "YES", "NO", "THANK YOU", "YOU'RE WELCOME", "HELLO",
     "I AM", "HAPPY", "SAD", "TIRED", "HOT", "COLD", "EXCITED",
@@ -49,11 +65,40 @@ DEFAULT_PHRASES_LIST = [
 MENTAL_COMMAND_OPTIONS = ["push", "pull", "lift", "drop", "left", "right", "rotateClockwise", "rotateCounterClockwise", "disappear", "None"]
 FACIAL_EXPRESSION_OPTIONS = ["clench", "furrow", "smile", "surprise", "smirkLeft", "smirkRight", "laugh", "None"]
 
+# Labels Cortex includes with the electrodes that are not electrodes.
+NON_SENSOR_LABELS = {"OVERALL", "CMS", "DRL", "BATTERY", "SIGNAL"}
+
+ACTION_TOKENS = {"FLIP OVER", "SPEAK", "BACKSPACE", "PAUSE SCANNER",
+                 "CLEAR MESSAGE", "SPACE"}
+
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    return cfg
+        except Exception as e:
+            print(f"[config] could not read {CONFIG_PATH}: {e}")
+    return {}
+
+
+def save_config(patch: dict):
+    """Merge into config.json, so one screen's setting never wipes another's."""
+    cfg = load_config()
+    cfg.update(patch)
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"[config] could not write {CONFIG_PATH}: {e}")
+
 
 def load_phrases_from_file():
     if os.path.exists(PHRASES_PATH):
         try:
-            with open(PHRASES_PATH, "r") as f:
+            with open(PHRASES_PATH, "r", encoding="utf-8") as f:
                 phrases = json.load(f)
                 if isinstance(phrases, list) and len(phrases) > 0:
                     return phrases
@@ -65,7 +110,7 @@ def build_phrase_matrix(phrases_list):
     items = phrases_list[:]
     if "FLIP OVER" not in items:
         items.append("FLIP OVER")
-        
+
     matrix = []
     col_count = 7
     for i in range(0, len(items), col_count):
@@ -92,9 +137,9 @@ BOARD_2_ALPHA = [
 class PhraseManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Caregiver Custom Phrase Manager")
+        self.setWindowTitle(t("phrases.title"))
         self.setFixedSize(520, 420)
-        
+
         self.setStyleSheet("""
             QDialog { background-color: #ffffff; font-family: 'Segoe UI'; }
             QLabel { color: #1e293b; font-size: 11px; font-weight: bold; }
@@ -111,14 +156,15 @@ class PhraseManagerDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        header_lbl = QLabel("📝 Manage Communication Board Phrases")
+        header_lbl = QLabel(t("phrases.header"))
         header_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         header_lbl.setStyleSheet("color: #d9145a; margin-bottom: 5px;")
         layout.addWidget(header_lbl)
 
-        sub_lbl = QLabel("Caregivers can add daily requests, family names, or custom phrases below.")
+        sub_lbl = QLabel(t("phrases.subtitle"))
         sub_lbl.setFont(QFont("Segoe UI", 9))
         sub_lbl.setStyleSheet("color: #64748b; margin-bottom: 10px;")
+        sub_lbl.setWordWrap(True)
         layout.addWidget(sub_lbl)
 
         body_layout = QHBoxLayout()
@@ -128,19 +174,19 @@ class PhraseManagerDialog(QDialog):
         btn_column = QVBoxLayout()
         btn_column.setSpacing(8)
 
-        add_btn = QPushButton("+ Add Phrase")
+        add_btn = QPushButton("+ " + t("phrases.add"))
         add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         add_btn.setStyleSheet("QPushButton { padding: 8px; background-color: #2ecc71; color: white; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #27ae60; }")
         add_btn.clicked.connect(self.add_phrase)
         btn_column.addWidget(add_btn)
 
-        edit_btn = QPushButton("✏️ Edit Selected")
+        edit_btn = QPushButton("✏️")
         edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         edit_btn.setStyleSheet("QPushButton { padding: 8px; background-color: #4f5d75; color: white; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #3b4758; }")
         edit_btn.clicked.connect(self.edit_phrase)
         btn_column.addWidget(edit_btn)
 
-        delete_btn = QPushButton("🗑️ Remove")
+        delete_btn = QPushButton("🗑️ " + t("phrases.remove"))
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.setStyleSheet("QPushButton { padding: 8px; background-color: #e74c3c; color: white; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #c0392b; }")
         delete_btn.clicked.connect(self.delete_phrase)
@@ -154,13 +200,13 @@ class PhraseManagerDialog(QDialog):
         footer_btn_layout = QHBoxLayout()
         footer_btn_layout.addStretch()
 
-        cancel_btn = QPushButton("Cancel")
+        cancel_btn = QPushButton(t("phrases.cancel"))
         cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.setStyleSheet("QPushButton { padding: 8px 16px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f1f5f9; color: #334155; font-weight: bold; }")
         cancel_btn.clicked.connect(self.reject)
         footer_btn_layout.addWidget(cancel_btn)
 
-        save_btn = QPushButton("Save & Reload Board")
+        save_btn = QPushButton(t("phrases.save"))
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_btn.setStyleSheet("QPushButton { padding: 8px 20px; background-color: #d9145a; color: white; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #b00f46; }")
         save_btn.clicked.connect(self.save_phrases)
@@ -175,21 +221,43 @@ class PhraseManagerDialog(QDialog):
         phrases = load_phrases_from_file()
         for p in phrases:
             if p != "FLIP OVER":
-                self.phrase_list_widget.addItem(p)
+                # Shown translated where we have a translation, so a Chinese
+                # caregiver reads the board's own vocabulary in Chinese.
+                item_text = i18n.cell(p)
+                self.phrase_list_widget.addItem(item_text)
+                self.phrase_list_widget.item(
+                    self.phrase_list_widget.count() - 1).setData(
+                        Qt.ItemDataRole.UserRole, p)
+
+    def _tokens(self):
+        tokens = []
+        for i in range(self.phrase_list_widget.count()):
+            item = self.phrase_list_widget.item(i)
+            token = item.data(Qt.ItemDataRole.UserRole) or item.text()
+            tokens.append(token)
+        return tokens
 
     def add_phrase(self):
-        text, ok = QInputDialog.getText(self, "Add Phrase", "Enter new word or phrase:")
+        text, ok = QInputDialog.getText(self, t("phrases.prompt_title"),
+                                        t("phrases.prompt_body"))
         if ok and text.strip():
             clean_text = text.strip().upper()
             self.phrase_list_widget.addItem(clean_text)
+            self.phrase_list_widget.item(
+                self.phrase_list_widget.count() - 1).setData(
+                    Qt.ItemDataRole.UserRole, clean_text)
 
     def edit_phrase(self):
         current_item = self.phrase_list_widget.currentItem()
         if not current_item:
             return
-        text, ok = QInputDialog.getText(self, "Edit Phrase", "Update phrase:", QLineEdit.EchoMode.Normal, current_item.text())
+        text, ok = QInputDialog.getText(self, t("phrases.prompt_title"),
+                                        t("phrases.prompt_body"),
+                                        QLineEdit.EchoMode.Normal,
+                                        current_item.text())
         if ok and text.strip():
             current_item.setText(text.strip().upper())
+            current_item.setData(Qt.ItemDataRole.UserRole, text.strip().upper())
 
     def delete_phrase(self):
         row = self.phrase_list_widget.currentRow()
@@ -197,23 +265,24 @@ class PhraseManagerDialog(QDialog):
             self.phrase_list_widget.takeItem(row)
 
     def save_phrases(self):
-        phrases = [self.phrase_list_widget.item(i).text() for i in range(self.phrase_list_widget.count())]
+        phrases = self._tokens()
         if "FLIP OVER" not in phrases:
             phrases.append("FLIP OVER")
         try:
-            with open(PHRASES_PATH, "w") as f:
-                json.dump(phrases, f, indent=4)
+            with open(PHRASES_PATH, "w", encoding="utf-8") as f:
+                json.dump(phrases, f, indent=4, ensure_ascii=False)
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Could not save phrases.json:\n{e}")
 
 
 class CortexCredentialsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, facial_supported=True):
         super().__init__(parent)
-        self.setWindowTitle("EMOTIV Cortex API & Trigger Mapping Configuration")
-        self.setFixedSize(540, 500)
-        
+        self.facial_supported = facial_supported
+        self.setWindowTitle(t("creds.title"))
+        self.setFixedSize(540, 520)
+
         self.setStyleSheet("""
             QDialog { background-color: #ffffff; font-family: 'Segoe UI'; }
             QLabel { color: #1e293b; font-size: 11px; font-weight: bold; }
@@ -228,13 +297,14 @@ class CortexCredentialsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(25, 20, 25, 20)
 
-        header_lbl = QLabel("EMOTIV Cortex API & Application Setup")
+        header_lbl = QLabel(t("creds.title"))
         header_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         header_lbl.setStyleSheet("color: #d9145a; margin-bottom: 2px;")
         layout.addWidget(header_lbl)
 
-        sub_lbl = QLabel("Configure credentials, default input streams, and action mappings.")
+        sub_lbl = QLabel(t("creds.help"))
         sub_lbl.setFont(QFont("Segoe UI", 9))
+        sub_lbl.setWordWrap(True)
         sub_lbl.setStyleSheet("color: #64748b; margin-bottom: 10px;")
         layout.addWidget(sub_lbl)
 
@@ -242,51 +312,62 @@ class CortexCredentialsDialog(QDialog):
         form_layout.setSpacing(10)
 
         self.client_id_input = QLineEdit()
-        self.client_id_input.setPlaceholderText("Leave empty if cloud licensed...")
-        form_layout.addRow("Client ID (Optional):", self.client_id_input)
+        form_layout.addRow(t("creds.client_id") + ":", self.client_id_input)
 
         self.client_secret_input = QLineEdit()
         self.client_secret_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.client_secret_input.setPlaceholderText("Leave empty if cloud licensed...")
-        form_layout.addRow("Client Secret (Optional):", self.client_secret_input)
+        form_layout.addRow(t("creds.client_secret") + ":", self.client_secret_input)
 
         self.profile_name_input = QLineEdit()
         self.profile_name_input.setPlaceholderText("e.g. John_Insight")
-        form_layout.addRow("Profile Name:", self.profile_name_input)
+        form_layout.addRow(t("creds.profile") + ":", self.profile_name_input)
 
-        sep_label1 = QLabel("─── Default Active Telemetry Streams ───")
+        sep_label1 = QLabel("───────────")
         sep_label1.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sep_label1.setStyleSheet("color: #94a3b8; font-size: 10px; margin-top: 6px; margin-bottom: 2px;")
         form_layout.addRow(sep_label1)
 
-        self.include_mental_cb = QCheckBox("Enable Mental Commands by Default")
+        self.include_mental_cb = QCheckBox(t("creds.include_mental"))
         self.include_mental_cb.setChecked(True)
         form_layout.addRow("", self.include_mental_cb)
 
-        self.include_facial_cb = QCheckBox("Enable Facial Expressions by Default")
+        self.include_facial_cb = QCheckBox(t("creds.include_facial"))
         self.include_facial_cb.setChecked(True)
         form_layout.addRow("", self.include_facial_cb)
 
-        sep_label2 = QLabel("─── BCI Action Trigger Mappings ───")
+        sep_label2 = QLabel("───────────")
         sep_label2.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sep_label2.setStyleSheet("color: #94a3b8; font-size: 10px; margin-top: 6px; margin-bottom: 2px;")
         form_layout.addRow(sep_label2)
 
         self.select_thought_combo = QComboBox()
         self.select_thought_combo.addItems(MENTAL_COMMAND_OPTIONS)
-        form_layout.addRow("SELECT (Mental Command):", self.select_thought_combo)
+        form_layout.addRow(t("creds.select_thought") + ":", self.select_thought_combo)
 
         self.select_facial_combo = QComboBox()
         self.select_facial_combo.addItems(FACIAL_EXPRESSION_OPTIONS)
-        form_layout.addRow("SELECT (Facial):", self.select_facial_combo)
+        self.select_facial_row = form_layout.rowCount()
+        form_layout.addRow(t("creds.select_facial") + ":", self.select_facial_combo)
 
         self.speed_thought_combo = QComboBox()
         self.speed_thought_combo.addItems(MENTAL_COMMAND_OPTIONS)
-        form_layout.addRow("CHANGE SPEED (Mental Cmd):", self.speed_thought_combo)
+        form_layout.addRow(t("creds.speed_thought") + ":", self.speed_thought_combo)
 
         self.speed_facial_combo = QComboBox()
         self.speed_facial_combo.addItems(FACIAL_EXPRESSION_OPTIONS)
-        form_layout.addRow("CHANGE SPEED (Facial):", self.speed_facial_combo)
+        form_layout.addRow(t("creds.speed_facial") + ":", self.speed_facial_combo)
+
+        if not facial_supported:
+            # Offering a facial trigger on a headset that has no facial stream
+            # would be a setting that silently never fires.
+            note = QLabel(t("board.facial_unsupported"))
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #d9145a; font-weight: bold; font-size: 10px;")
+            form_layout.addRow("", note)
+            for widget in (self.include_facial_cb, self.select_facial_combo,
+                           self.speed_facial_combo):
+                widget.setEnabled(False)
+            self.include_facial_cb.setChecked(False)
 
         layout.addLayout(form_layout)
         layout.addSpacing(15)
@@ -296,13 +377,13 @@ class CortexCredentialsDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        cancel_btn = QPushButton("Cancel")
+        cancel_btn = QPushButton(t("creds.cancel"))
         cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.setStyleSheet("QPushButton { padding: 8px 16px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f1f5f9; color: #334155; font-weight: bold; }")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
 
-        save_btn = QPushButton("Save & Connect")
+        save_btn = QPushButton(t("creds.save"))
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         save_btn.setStyleSheet("QPushButton { padding: 8px 20px; background-color: #d9145a; color: white; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #b00f46; }")
@@ -312,227 +393,297 @@ class CortexCredentialsDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def load_existing_config(self):
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = json.load(f)
-                    self.client_id_input.setText(cfg.get("cortex_client_id", cfg.get("client_id", "")))
-                    self.client_secret_input.setText(cfg.get("cortex_client_secret", cfg.get("client_secret", "")))
-                    self.profile_name_input.setText(cfg.get("profile_name", ""))
+        cfg = load_config()
+        if not cfg:
+            return
+        self.client_id_input.setText(cfg.get("cortex_client_id", cfg.get("client_id", "")))
+        self.client_secret_input.setText(cfg.get("cortex_client_secret", cfg.get("client_secret", "")))
+        self.profile_name_input.setText(cfg.get("profile_name", ""))
 
-                    self.include_mental_cb.setChecked(cfg.get("include_mental_commands", True))
-                    self.include_facial_cb.setChecked(cfg.get("include_facial_expressions", True))
+        self.include_mental_cb.setChecked(cfg.get("include_mental_commands", True))
+        if self.facial_supported:
+            self.include_facial_cb.setChecked(cfg.get("include_facial_expressions", True))
 
-                    sel_th = cfg.get("select_thought", "push")
-                    sel_fc = cfg.get("select_facial", "clench")
-                    spd_th = cfg.get("speed_thought", "pull")
-                    spd_fc = cfg.get("speed_facial", "furrow")
+        sel_th = cfg.get("select_thought", "push")
+        sel_fc = cfg.get("select_facial", "clench")
+        spd_th = cfg.get("speed_thought", "pull")
+        spd_fc = cfg.get("speed_facial", "furrow")
 
-                    if sel_th in MENTAL_COMMAND_OPTIONS: self.select_thought_combo.setCurrentText(sel_th)
-                    if sel_fc in FACIAL_EXPRESSION_OPTIONS: self.select_facial_combo.setCurrentText(sel_fc)
-                    if spd_th in MENTAL_COMMAND_OPTIONS: self.speed_thought_combo.setCurrentText(spd_th)
-                    if spd_fc in FACIAL_EXPRESSION_OPTIONS: self.speed_facial_combo.setCurrentText(spd_fc)
-
-            except Exception:
-                pass
+        if sel_th in MENTAL_COMMAND_OPTIONS: self.select_thought_combo.setCurrentText(sel_th)
+        if sel_fc in FACIAL_EXPRESSION_OPTIONS: self.select_facial_combo.setCurrentText(sel_fc)
+        if spd_th in MENTAL_COMMAND_OPTIONS: self.speed_thought_combo.setCurrentText(spd_th)
+        if spd_fc in FACIAL_EXPRESSION_OPTIONS: self.speed_facial_combo.setCurrentText(spd_fc)
 
     def save_config(self):
-        client_id = self.client_id_input.text().strip()
-        client_secret = self.client_secret_input.text().strip()
-        profile_name = self.profile_name_input.text().strip()
-
-        cfg = {
-            "cortex_client_id": client_id,
-            "cortex_client_secret": client_secret,
-            "profile_name": profile_name,
+        save_config({
+            "cortex_client_id": self.client_id_input.text().strip(),
+            "cortex_client_secret": self.client_secret_input.text().strip(),
+            "profile_name": self.profile_name_input.text().strip(),
             "include_mental_commands": self.include_mental_cb.isChecked(),
             "include_facial_expressions": self.include_facial_cb.isChecked(),
             "select_thought": self.select_thought_combo.currentText(),
             "select_facial": self.select_facial_combo.currentText(),
             "speed_thought": self.speed_thought_combo.currentText(),
-            "speed_facial": self.speed_facial_combo.currentText()
-        }
-
-        try:
-            with open(CONFIG_PATH, "w") as f:
-                json.dump(cfg, f, indent=4)
-            self.accept()
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save config.json:\n{e}")
+            "speed_facial": self.speed_facial_combo.currentText(),
+        })
+        self.accept()
 
 
 class TTSThread(QThread):
-    def __init__(self, text):
+    def __init__(self, text, language="en"):
         super().__init__()
         self.text = text
+        self.language = language
 
     def run(self):
         try:
             import pyttsx3
             engine = pyttsx3.init()
+            self._select_voice(engine)
             engine.say(self.text)
             engine.runAndWait()
         except Exception as e:
             print(f"[TTS Exception] {e}")
 
+    def _select_voice(self, engine):
+        """Pick a voice that can actually pronounce the text.
+
+        The board speaks whatever language its labels are in, and the default
+        system voice will read Chinese characters as silence. If no Chinese
+        voice is installed we say so in the log rather than failing quietly —
+        installing one is a Windows/macOS setting, not something the app can do.
+        """
+        if self.language != "zh":
+            return
+        try:
+            wanted = ("chinese", "zh_", "zh-", "huihui", "yaoyao", "tingting",
+                      "mandarin", "中文")
+            for voice in engine.getProperty("voices"):
+                haystack = f"{voice.id} {getattr(voice, 'name', '')}".lower()
+                if any(token in haystack for token in wanted):
+                    engine.setProperty("voice", voice.id)
+                    return
+            print("[TTS] No Chinese voice is installed; speech will be wrong or "
+                  "silent. Add one in the operating system's speech settings.")
+        except Exception as e:
+            print(f"[TTS] Could not inspect voices: {e}")
+
 
 class EmotivCortexWorker(QThread):
-    mental_command_signal = pyqtSignal(str, float)
-    contact_quality_signal = pyqtSignal(dict)  
-    eeg_quality_signal = pyqtSignal(dict)      
-    facial_expression_signal = pyqtSignal(str, float, str, float)
-    device_diagnostics_signal = pyqtSignal(int, int) 
-    device_name_signal = pyqtSignal(str)       
-    status_signal = pyqtSignal(str)
+    """Owns the Cortex connection and translates its events into Qt signals.
 
+    Everything here used to be read out of raw WebSocket frames by guessing
+    array offsets, which is what tied the app to one five-sensor headset. It now
+    listens to Cortex's own events and takes the channel names from the
+    subscription result, so the number and names of sensors come from the
+    hardware rather than from a constant.
+    """
+
+    headsets_signal = pyqtSignal(list)
+    connected_signal = pyqtSignal(str)
+    contact_quality_signal = pyqtSignal(dict)
+    eeg_quality_signal = pyqtSignal(dict)
+    device_diagnostics_signal = pyqtSignal(int, int)
+    mental_command_signal = pyqtSignal(str, float)
+    facial_expression_signal = pyqtSignal(str, float, str, float)
+    status_signal = pyqtSignal(str, dict)
+    stream_failed_signal = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.cortex = None
+        self._lock = threading.Lock()
+        self._labels = {}
+        self._wanted_headset = ""
+        self._want_facial = True
+
+    # ── called from the UI thread ────────────────────────────────────────
+    def connect_to(self, headset_id: str, want_facial: bool = True):
+        """Choose the headset and let the connection sequence continue."""
+        self._wanted_headset = headset_id
+        self._want_facial = want_facial
+        with self._lock:
+            if self.cortex:
+                self.cortex.set_wanted_headset(headset_id)
+                try:
+                    self.cortex.query_headset()
+                except Exception as e:
+                    self.status_signal.emit("status.failed", {"detail": str(e)})
+
+    def refresh_headsets(self):
+        with self._lock:
+            if self.cortex:
+                try:
+                    self.cortex.query_headset()
+                except Exception as e:
+                    self.status_signal.emit("status.failed", {"detail": str(e)})
+
+    # ── the thread itself ────────────────────────────────────────────────
     def run(self):
-        self.status_signal.emit("Connecting to Cortex Service...")
-        
-        client_id = ""
-        client_secret = ""
-        profile_name = ""
-        
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r") as f:
-                    config = json.load(f)
-                    client_id = config.get("cortex_client_id", config.get("client_id", ""))
-                    client_secret = config.get("cortex_client_secret", config.get("client_secret", ""))
-                    profile_name = config.get("profile_name", "")
-            except Exception as e:
-                self.status_signal.emit(f"Error loading config.json: {e}")
+        self.status_signal.emit("status.connecting", {})
+
+        cfg = load_config()
+        client_id = cfg.get("cortex_client_id", cfg.get("client_id", ""))
+        client_secret = cfg.get("cortex_client_secret", cfg.get("client_secret", ""))
+        profile_name = cfg.get("profile_name", "")
 
         try:
             from cortex import Cortex
         except ImportError:
-            self.status_signal.emit("Could not find 'cortex.py' file.")
+            self.status_signal.emit("status.no_cortex_file", {})
             return
 
         try:
             cortex = Cortex(client_id, client_secret)
+            with self._lock:
+                self.cortex = cortex
 
-            orig_on_message = cortex.on_message
-            
-            def patched_on_message(ws, message):
-                try:
-                    msg = json.loads(message)
-                    if isinstance(msg, dict):
-                        if "dev" in msg:
-                            raw_dev = msg["dev"]
-                            if isinstance(raw_dev, list) and len(raw_dev) >= 2:
-                                batt_pct = 100
-                                sig_pct = 100
-                                if len(raw_dev) >= 4 and isinstance(raw_dev[3], (int, float)):
-                                    batt_pct = int(raw_dev[3])
-                                elif isinstance(raw_dev[0], (int, float)):
-                                    batt_pct = int((raw_dev[0] / 4.0) * 100)
-                                    
-                                if isinstance(raw_dev[1], (int, float)):
-                                    sig_pct = int(raw_dev[1] * 50) if raw_dev[1] <= 2 else int(raw_dev[1])
+            cortex.bind(headset_list_done=self._on_headset_list)
+            cortex.bind(create_session_done=lambda *a, **k:
+                        self._on_session(profile_name))
+            cortex.bind(new_data_labels=self._on_labels)
+            cortex.bind(new_dev_data=self._on_dev)
+            cortex.bind(new_eq_data=self._on_eq)
+            cortex.bind(new_com_data=self._on_com)
+            cortex.bind(new_fe_data=self._on_fac)
+            cortex.bind(sub_failure=self._on_sub_failure)
+            cortex.bind(inform_error=self._on_error)
 
-                                self.device_diagnostics_signal.emit(batt_pct, sig_pct)
-
-                                nested_list = None
-                                for item in raw_dev:
-                                    if isinstance(item, list):
-                                        nested_list = item
-                                        break
-                                numbers = nested_list if nested_list and len(nested_list) >= 5 else raw_dev[2 if len(raw_dev) == 8 else 0:]
-                                if len(numbers) >= 5:
-                                    self.contact_quality_signal.emit({
-                                        "AF3": int(numbers[0]),
-                                        "T7":  int(numbers[1]),
-                                        "Pz":  int(numbers[2]),
-                                        "T8":  int(numbers[3]),
-                                        "AF4": int(numbers[4])
-                                    })
-                                    self.status_signal.emit("Live Stream Active. Monitoring Diagnostics...")
-                        
-                        if "eq" in msg:
-                            raw_eq = msg["eq"]
-                            if isinstance(raw_eq, list) and len(raw_eq) >= 3:
-                                batt_pct = int(raw_eq[0]) if isinstance(raw_eq[0], (int, float)) else 100
-                                srq = float(raw_eq[2]) if isinstance(raw_eq[2], (int, float)) else 1.0
-                                sig_pct = int(srq * 100) if srq >= 0 else 0
-                                self.device_diagnostics_signal.emit(batt_pct, sig_pct)
-
-                                numbers = raw_eq[3 if len(raw_eq) == 8 else 0:]
-                                if len(numbers) >= 5:
-                                    self.eeg_quality_signal.emit({
-                                        "AF3": int(numbers[0]),
-                                        "T7":  int(numbers[1]),
-                                        "Pz":  int(numbers[2]),
-                                        "T8":  int(numbers[3]),
-                                        "AF4": int(numbers[4])
-                                    })
-                                    self.status_signal.emit("Live Stream Active. Monitoring Diagnostics...")
-                                    
-                        if "fac" in msg:
-                            raw_fac = msg["fac"]
-                            if isinstance(raw_fac, list) and len(raw_fac) >= 5:
-                                u_act = str(raw_fac[1])
-                                u_pow = float(raw_fac[2])
-                                l_act = str(raw_fac[3])
-                                l_pow = float(raw_fac[4])
-                                self.facial_expression_signal.emit(u_act, u_pow, l_act, l_pow)
-                                
-                except Exception:
-                    pass
-                
-                return orig_on_message(ws, message)
-
-            cortex.on_message = patched_on_message
-
-            def handle_data_packet(*args, **kwargs):
-                data = kwargs.get("data", args[0] if args else {})
-                if isinstance(data, dict) and "action" in data and "power" in data:
-                    self.mental_command_signal.emit(str(data["action"]), float(data["power"]))
-                elif isinstance(data, dict) and "com" in data:
-                    self.mental_command_signal.emit(str(data["com"][0]), float(data["com"][1]))
-
-            def session_done_callback(*args, **kwargs):
-                if hasattr(cortex, "headset_id") and cortex.headset_id:
-                    self.device_name_signal.emit(str(cortex.headset_id))
-                else:
-                    self.device_name_signal.emit("INSIGHT HEADSET")
-
-                if profile_name:
-                    self.status_signal.emit(f"Loading Profile: {profile_name}...")
-                    if hasattr(cortex, "setup_profile"):
-                        cortex.setup_profile(profile_name, "load")
-                    elif hasattr(cortex, "load_profile"):
-                        cortex.load_profile(profile_name)
-                
-                for method_name in ["subscribe", "sub_request", "request_sub", "send_subscribe"]:
-                    if hasattr(cortex, method_name):
-                        getattr(cortex, method_name)(["com", "dev", "eq", "fac"])
-                        break
-
-            cortex.bind(create_session_done=session_done_callback)
-            cortex.bind(new_com_data=handle_data_packet)
-            
-            self.status_signal.emit("Cortex Linked. Waiting for Device Packets...")
+            self.status_signal.emit("status.linked", {})
             cortex.open()
-            
         except Exception as e:
-            self.status_signal.emit(f"Cortex Connection Failed: {e}")
+            self.status_signal.emit("status.failed", {"detail": str(e)})
+
+    # ── Cortex events ────────────────────────────────────────────────────
+    def _on_headset_list(self, *args, **kwargs):
+        data = kwargs.get("data", args[0] if args else [])
+        headsets = []
+        for entry in data or []:
+            if not isinstance(entry, dict):
+                continue
+            headsets.append({
+                "id": entry.get("id", ""),
+                "status": entry.get("status", ""),
+                "connectedBy": entry.get("connectedBy", ""),
+                "firmware": entry.get("firmware", ""),
+                "settings": entry.get("settings", {}) or {},
+            })
+        self.headsets_signal.emit(headsets)
+
+    def _on_session(self, profile_name):
+        headset_id = ""
+        with self._lock:
+            if self.cortex:
+                headset_id = getattr(self.cortex, "headset_id", "") or ""
+        self.connected_signal.emit(headset_id)
+
+        if profile_name:
+            self.status_signal.emit("status.loading_profile", {"profile": profile_name})
+            with self._lock:
+                if self.cortex and hasattr(self.cortex, "setup_profile"):
+                    try:
+                        self.cortex.setup_profile(profile_name, "load")
+                    except Exception as e:
+                        print(f"[cortex] could not load profile: {e}")
+
+        streams = devices.streams_for(headset_id, self._want_facial)
+        with self._lock:
+            if self.cortex:
+                self.cortex.sub_request(streams)
+
+    def _on_labels(self, *args, **kwargs):
+        data = kwargs.get("data", args[0] if args else {})
+        if not isinstance(data, dict):
+            return
+        stream = data.get("streamName", "")
+        labels = [str(x) for x in (data.get("labels") or [])]
+        self._labels[stream] = labels
+
+    def _quality_map(self, stream, values):
+        """Pair the grades with their channel names, dropping the non-electrodes."""
+        labels = self._labels.get(stream, [])
+        pairs = zip(labels, values) if labels else []
+        return {name: int(value) for name, value in pairs
+                if str(name).upper() not in NON_SENSOR_LABELS
+                and isinstance(value, (int, float))}
+
+    def _on_dev(self, *args, **kwargs):
+        data = kwargs.get("data", args[0] if args else {})
+        if not isinstance(data, dict):
+            return
+        battery = data.get("batteryPercent")
+        signal = data.get("signal")
+        if isinstance(battery, (int, float)) and isinstance(signal, (int, float)):
+            # `signal` is 0-2 from Cortex (0 bad, 1 good, 2 excellent-ish).
+            self.device_diagnostics_signal.emit(
+                int(battery), int(min(100, max(0, signal * 50))))
+
+        mapping = self._quality_map("dev", data.get("dev") or [])
+        if mapping:
+            self.contact_quality_signal.emit(mapping)
+            self.status_signal.emit("status.live", {})
+
+    def _on_eq(self, *args, **kwargs):
+        data = kwargs.get("data", args[0] if args else {})
+        if not isinstance(data, dict):
+            return
+        mapping = self._quality_map("eq", data.get("eq") or [])
+        if mapping:
+            self.eeg_quality_signal.emit(mapping)
+
+    def _on_com(self, *args, **kwargs):
+        data = kwargs.get("data", args[0] if args else {})
+        if isinstance(data, dict) and "action" in data and "power" in data:
+            self.mental_command_signal.emit(str(data["action"]), float(data["power"]))
+
+    def _on_fac(self, *args, **kwargs):
+        data = kwargs.get("data", args[0] if args else {})
+        if not isinstance(data, dict):
+            return
+        self.facial_expression_signal.emit(
+            str(data.get("uAct", "")), float(data.get("uPow", 0.0) or 0.0),
+            str(data.get("lAct", "")), float(data.get("lPow", 0.0) or 0.0))
+
+    def _on_sub_failure(self, *args, **kwargs):
+        stream = kwargs.get("stream", "")
+        message = kwargs.get("message", "")
+        self.stream_failed_signal.emit(str(stream), str(message))
+
+    def _on_error(self, *args, **kwargs):
+        error = kwargs.get("error_data", {})
+        detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        self.status_signal.emit("status.failed", {"detail": detail})
 
 
 class HeadsetMapWidget(QWidget):
+    """The head seen from above, with whatever sensors this headset has.
+
+    The positions come from devices.layout_for(), so five, fourteen or two
+    electrodes all draw correctly and an unfamiliar headset still shows every
+    channel it reports.
+    """
+
     def __init__(self):
         super().__init__()
         self.setFixedSize(360, 360)
-        self.cq_status = {"AF3": 0, "AF4": 0, "T7": 0, "T8": 0, "Pz": 0}
-        self.eq_status = {"AF3": 0, "AF4": 0, "T7": 0, "T8": 0, "Pz": 0}
-        self.display_mode = "CQ" 
-        
-        self.sensor_positions = {
-            "AF3": (120, 75),   
-            "AF4": (240, 75),   
-            "T7":  (50, 165),   
-            "T8":  (310, 165),  
-            "Pz":  (180, 285)   
-        }
+        self.channels = []
+        self.cq_status = {}
+        self.eq_status = {}
+        self.display_mode = "CQ"
+
+    def set_channels(self, channels):
+        self.channels = [c for c in (channels or [])
+                         if str(c).upper() not in NON_SENSOR_LABELS]
+        self.cq_status = {c: self.cq_status.get(c, 0) for c in self.channels}
+        self.eq_status = {c: self.eq_status.get(c, 0) for c in self.channels}
+        self.update()
+
+    def update_quality(self, mode, mapping):
+        target = self.cq_status if mode == "CQ" else self.eq_status
+        target.update(mapping)
+        if not self.channels:
+            self.set_channels(list(mapping.keys()))
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -541,83 +692,159 @@ class HeadsetMapWidget(QWidget):
         painter.setBrush(QColor("#eef2f7"))
         painter.setPen(QPen(QColor("#cbd5e1"), 2))
         painter.drawEllipse(40, 40, 280, 280)
-        
+
+        # The nose, so left and right are never ambiguous.
         painter.setBrush(QColor("#cbd5e1"))
         painter.drawPolygon([QPoint(165, 40), QPoint(195, 40), QPoint(180, 15)])
 
-        active_dataset = self.cq_status if self.display_mode == "CQ" else self.eq_status
+        active = self.cq_status if self.display_mode == "CQ" else self.eq_status
+        placed = devices.layout_for(self.channels)
+        radius = 14 if len(placed) > 8 else 16
+        font_size = 7 if len(placed) > 8 else 8
 
-        for sensor, (x, y) in self.sensor_positions.items():
-            val = active_dataset.get(sensor, 0)
-            
+        for name, nx, ny in placed:
+            x = 180 + int(nx * 140)
+            y = 180 + int(ny * 140)
+            val = active.get(name, 0)
+
             if val >= 3:
-                node_color = QColor("#2ecc71")     
-                border_color = QColor("#27ae60")
+                node_color, border_color = QColor("#2ecc71"), QColor("#27ae60")
             elif val > 0:
-                node_color = QColor("#f39c12")    
-                border_color = QColor("#d35400")
+                node_color, border_color = QColor("#f39c12"), QColor("#d35400")
             else:
-                node_color = QColor("#1e1e24")    
-                border_color = QColor("#334155")
+                node_color, border_color = QColor("#1e1e24"), QColor("#334155")
 
             painter.setBrush(node_color)
             painter.setPen(QPen(border_color, 2))
-            painter.drawEllipse(x - 16, y - 16, 32, 32)
+            painter.drawEllipse(x - radius, y - radius, radius * 2, radius * 2)
 
             painter.setPen(QPen(QColor("#ffffff") if val == 0 else QColor("#111111")))
-            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            painter.drawText(x - 13, y + 4, sensor)
+            painter.setFont(QFont("Segoe UI", font_size, QFont.Weight.Bold))
+            painter.drawText(x - radius + 1, y + 4, name)
+
+
+class QualityPill(QWidget):
+    """Contact, EEG and battery at a glance, live, on the board screen.
+
+    The pre-flight screen answers "is the headset on properly" once. This
+    answers "is it still on properly" for the rest of the session, which is the
+    question that actually matters when a selection stops working.
+    """
+
+    def __init__(self):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(12)
+
+        self.device_lbl = QLabel("—")
+        self.device_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.device_lbl.setStyleSheet("color: #1e293b; border: none;")
+        layout.addWidget(self.device_lbl)
+
+        self.contact_lbl = QLabel()
+        self.contact_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        layout.addWidget(self.contact_lbl)
+
+        self.eeg_lbl = QLabel()
+        self.eeg_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        layout.addWidget(self.eeg_lbl)
+
+        self.battery_lbl = QLabel()
+        self.battery_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        layout.addWidget(self.battery_lbl)
+
+        self.setStyleSheet("QWidget { background-color: #ffffff; border: 1px solid #e2e8f0;"
+                           "border-radius: 6px; }")
+        self.set_device("")
+        self.set_contact(None)
+        self.set_eeg(None)
+        self.set_battery(None)
+
+    @staticmethod
+    def _colour(percent):
+        if percent is None:
+            return "#94a3b8"
+        if percent >= 80:
+            return "#27ae60"
+        if percent >= 50:
+            return "#f39c12"
+        return "#d9145a"
+
+    def set_device(self, headset_id):
+        self.device_lbl.setText(headset_id or t("pill.no_data"))
+
+    def set_contact(self, percent):
+        text = t("pill.contact", percent=percent if percent is not None else t("pill.no_data"))
+        self.contact_lbl.setText(text)
+        self.contact_lbl.setStyleSheet(f"color: {self._colour(percent)}; border: none;")
+
+    def set_eeg(self, percent):
+        text = t("pill.eeg", percent=percent if percent is not None else t("pill.no_data"))
+        self.eeg_lbl.setText(text)
+        self.eeg_lbl.setStyleSheet(f"color: {self._colour(percent)}; border: none;")
+
+    def set_battery(self, percent):
+        text = t("pill.battery", percent=percent if percent is not None else t("pill.no_data"))
+        self.battery_lbl.setText(text)
+        self.battery_lbl.setStyleSheet(f"color: {self._colour(percent)}; border: none;")
+
+
+PAGE_DEVICES = 0
+PAGE_PREFLIGHT = 1
+PAGE_BOARD = 2
 
 
 class BCICommunicationBoard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EMOTIV BCI Assistive Communication System")
-        
+
+        cfg = load_config()
+        i18n.set_language(cfg.get("language", "en"))
+        self.setWindowTitle(t("app.title"))
+
         self.page_container = QStackedWidget()
         self.setCentralWidget(self.page_container)
-        
+
         self.current_setup_tab = "CQ"
+        self.headsets = []
+        self.selected_headset = ""
+        self.device_facial_supported = True
+        self.contact_percent = None
+        self.eeg_percent = None
+        self.battery_percent = None
+
         self.load_bci_action_mappings()
+        self.build_device_screen()
         self.build_preflight_screen()
         self.build_keyboard_screen()
-        
+
+        self.page_container.addWidget(self.device_page)
         self.page_container.addWidget(self.setup_page)
         self.page_container.addWidget(self.keyboard_page)
-        self.page_container.setCurrentIndex(0) 
+        self.page_container.setCurrentIndex(PAGE_DEVICES)
 
         self.cortex_thread = None
         self.start_cortex_worker()
 
         QTimer.singleShot(500, self.check_credentials_on_launch)
 
+    # ── configuration ────────────────────────────────────────────────────
     def load_bci_action_mappings(self):
-        self.select_thought = "push"
-        self.select_facial = "clench"
-        self.speed_thought = "pull"
-        self.speed_facial = "furrow"
-        self.init_include_mental = True
-        self.init_include_facial = True
-
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = json.load(f)
-                    self.select_thought = cfg.get("select_thought", "push")
-                    self.select_facial = cfg.get("select_facial", "clench")
-                    self.speed_thought = cfg.get("speed_thought", "pull")
-                    self.speed_facial = cfg.get("speed_facial", "furrow")
-                    self.init_include_mental = cfg.get("include_mental_commands", True)
-                    self.init_include_facial = cfg.get("include_facial_expressions", True)
-            except Exception:
-                pass
+        cfg = load_config()
+        self.select_thought = cfg.get("select_thought", "push")
+        self.select_facial = cfg.get("select_facial", "clench")
+        self.speed_thought = cfg.get("speed_thought", "pull")
+        self.speed_facial = cfg.get("speed_facial", "furrow")
+        self.init_include_mental = cfg.get("include_mental_commands", True)
+        self.init_include_facial = cfg.get("include_facial_expressions", True)
 
     def closeEvent(self, event):
         print("[SYSTEM] Shutting down application...")
-        if hasattr(self, 'timer'):
-            self.timer.stop()
-        if hasattr(self, 'cooldown_ticker'):
-            self.cooldown_ticker.stop()
+        for timer_name in ("timer", "cooldown_ticker"):
+            timer = getattr(self, timer_name, None)
+            if timer:
+                timer.stop()
 
         event.accept()
         QApplication.quit()
@@ -631,13 +858,15 @@ class BCICommunicationBoard(QMainWindow):
             self.cortex_thread.wait(500)
 
         self.cortex_thread = EmotivCortexWorker()
+        self.cortex_thread.headsets_signal.connect(self.on_headsets)
+        self.cortex_thread.connected_signal.connect(self.on_headset_connected)
         self.cortex_thread.status_signal.connect(self.display_network_logs)
-        self.cortex_thread.device_name_signal.connect(self.update_hardware_banner)
         self.cortex_thread.device_diagnostics_signal.connect(self.update_device_diagnostics)
         self.cortex_thread.contact_quality_signal.connect(self.process_contact_quality)
         self.cortex_thread.eeg_quality_signal.connect(self.process_eeg_quality)
         self.cortex_thread.mental_command_signal.connect(self.route_bci_command)
         self.cortex_thread.facial_expression_signal.connect(self.route_facial_command)
+        self.cortex_thread.stream_failed_signal.connect(self.on_stream_failed)
         self.cortex_thread.start()
 
     def check_credentials_on_launch(self):
@@ -645,11 +874,12 @@ class BCICommunicationBoard(QMainWindow):
             self.open_credentials_dialog()
 
     def open_credentials_dialog(self):
-        dlg = CortexCredentialsDialog(self)
+        dlg = CortexCredentialsDialog(self, facial_supported=self.device_facial_supported)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.load_bci_action_mappings()
             self.mental_selector.setChecked(self.init_include_mental)
-            self.facial_selector.setChecked(self.init_include_facial)
+            self.facial_selector.setChecked(
+                self.init_include_facial and self.device_facial_supported)
             self.handle_stream_selectors_toggled()
             self.start_cortex_worker()
 
@@ -663,38 +893,342 @@ class BCICommunicationBoard(QMainWindow):
                 self.current_matrix = BOARD_1_PHRASES
                 self.build_board_grid()
 
+    # ── language ─────────────────────────────────────────────────────────
+    def build_language_toggle(self):
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.language_buttons = {}
+        for code, label in (("en", "EN"), ("zh", "中文")):
+            btn = QPushButton(label)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(28)
+            btn.setFixedWidth(52)
+            btn.clicked.connect(lambda _checked, c=code: self.set_language(c))
+            row.addWidget(btn)
+            self.language_buttons.setdefault(code, []).append(btn)
+        self.paint_language_toggle()
+        return row
+
+    def paint_language_toggle(self):
+        for code, buttons in getattr(self, "language_buttons", {}).items():
+            active = (code == i18n.language())
+            for btn in buttons:
+                btn.setStyleSheet(
+                    "QPushButton { background-color: %s; color: %s; border: 1px solid "
+                    "#cbd5e1; border-radius: 4px; font-weight: bold; }" % (
+                        "#d9145a" if active else "#f1f5f9",
+                        "#ffffff" if active else "#334155"))
+
+    def set_language(self, code):
+        if code == i18n.language():
+            return
+        i18n.set_language(code)
+        save_config({"language": code})
+        self.setWindowTitle(t("app.title"))
+        self.paint_language_toggle()
+        self.retranslate()
+
+    def retranslate(self):
+        """Redraw everything that is not a plain bound label."""
+        self.render_headset_list()
+        self.switch_setup_tab(self.current_setup_tab)
+        self.build_board_grid()
+        self.update_ui_highlights()
+        self.update_status_bar()
+        self.handle_stream_selectors_toggled()
+        self.update_telemetry_box("neutral")
+        # Re-say the current status in the new language rather than leaving the
+        # last sentence behind.
+        key, params = self.board_status
+        colour = self.keyboard_network_status_label.styleSheet()
+        colour = colour.split("color:")[-1].split(";")[0].strip() or "#2ecc71"
+        self.set_board_status(key, colour, **params)
+        self.refresh_quality_pill()
+        self.display_box.setText(t("board.composed", text=self.composed_text))
+        self.mental_slider_lbl.setText(
+            t("board.mental_sens", value=f"{self.MENTAL_THRESHOLD:.2f}"))
+        self.facial_slider_lbl.setText(
+            t("board.facial_sens", value=f"{self.FACIAL_THRESHOLD:.2f}"))
+        self.cooldown_slider_lbl.setText(
+            t("board.cooldown", value=f"{self.SELECTION_COOLDOWN_MS/1000:.1f}"))
+        self.update_preflight_metrics()
+
+    # ── screen 1: which headset ──────────────────────────────────────────
+    def build_device_screen(self):
+        self.device_page = QWidget()
+        self.device_page.setStyleSheet("background-color: #ffffff;")
+        layout = QVBoxLayout(self.device_page)
+        layout.setContentsMargins(40, 30, 40, 30)
+
+        header = QHBoxLayout()
+        title = i18n.bind(QLabel(), "device.title")
+        title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        title.setStyleSheet("color: #1a1a1a;")
+        header.addWidget(title)
+        header.addStretch()
+        header.addLayout(self.build_language_toggle())
+
+        self.device_config_btn = i18n.bind(QPushButton(), "nav.api_settings")
+        self.device_config_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.device_config_btn.setStyleSheet(
+            "QPushButton { background-color: #f1f5f9; color: #334155; border: 1px solid "
+            "#cbd5e1; padding: 6px 12px; border-radius: 4px; margin-left: 8px; } "
+            "QPushButton:hover { background-color: #e2e8f0; }")
+        self.device_config_btn.clicked.connect(self.open_credentials_dialog)
+        header.addWidget(self.device_config_btn)
+        layout.addLayout(header)
+
+        subtitle = i18n.bind(QLabel(), "device.subtitle")
+        subtitle.setFont(QFont("Segoe UI", 11))
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #64748b; margin-bottom: 12px;")
+        layout.addWidget(subtitle)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.device_list_host = QWidget()
+        self.device_list_layout = QVBoxLayout(self.device_list_host)
+        self.device_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.device_list_layout.setSpacing(10)
+        self.device_list_layout.addStretch()
+        scroll.setWidget(self.device_list_host)
+        layout.addWidget(scroll, stretch=1)
+
+        footer = QHBoxLayout()
+        self.device_status_lbl = i18n.bind(QLabel(), "device.searching")
+        self.device_status_lbl.setFont(QFont("Segoe UI", 10))
+        self.device_status_lbl.setStyleSheet("color: #64748b;")
+        footer.addWidget(self.device_status_lbl)
+        footer.addStretch()
+
+        self.device_refresh_btn = i18n.bind(QPushButton(), "device.refresh")
+        self.device_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.device_refresh_btn.setFixedHeight(40)
+        self.device_refresh_btn.setStyleSheet(
+            "QPushButton { background-color: #f1f5f9; color: #334155; border: 1px solid "
+            "#cbd5e1; padding: 8px 18px; border-radius: 4px; font-weight: bold; } "
+            "QPushButton:hover { background-color: #e2e8f0; }")
+        self.device_refresh_btn.clicked.connect(self.refresh_headsets)
+        footer.addWidget(self.device_refresh_btn)
+        layout.addLayout(footer)
+
+        self.render_headset_list()
+
+    def refresh_headsets(self):
+        i18n.bind(self.device_status_lbl, "device.searching")
+        if self.cortex_thread:
+            self.cortex_thread.refresh_headsets()
+
+    def on_headsets(self, headsets):
+        self.headsets = headsets
+        self.render_headset_list()
+
+    def render_headset_list(self):
+        while self.device_list_layout.count():
+            item = self.device_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self.headsets:
+            empty = QWidget()
+            empty_layout = QVBoxLayout(empty)
+            title = QLabel(t("device.none_title"))
+            title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+            title.setStyleSheet("color: #1e293b;")
+            body = QLabel(t("device.none_body"))
+            body.setWordWrap(True)
+            body.setStyleSheet("color: #64748b;")
+            empty_layout.addWidget(title)
+            empty_layout.addWidget(body)
+            empty.setStyleSheet("background-color: #f8fafc; border: 1px dashed #cbd5e1;"
+                                "border-radius: 8px;")
+            self.device_list_layout.addWidget(empty)
+            self.device_list_layout.addStretch()
+            return
+
+        for headset in self.headsets:
+            self.device_list_layout.addWidget(self.build_headset_card(headset))
+        self.device_list_layout.addStretch()
+
+    def build_headset_card(self, headset):
+        headset_id = headset.get("id", "")
+        info = devices.describe(headset_id)
+
+        card = QWidget()
+        card.setStyleSheet("QWidget { background-color: #f8fafc; border: 1px solid "
+                           "#e2e8f0; border-radius: 8px; }")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(16, 12, 16, 12)
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(2)
+
+        name = QLabel(info["name"] or headset_id)
+        name.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        name.setStyleSheet("color: #1e293b; border: none;")
+        text_column.addWidget(name)
+
+        ident = QLabel(headset_id)
+        ident.setFont(QFont("Segoe UI", 9))
+        ident.setStyleSheet("color: #94a3b8; border: none;")
+        text_column.addWidget(ident)
+
+        status_key = {
+            "connected": "device.status.connected",
+            "discovered": "device.status.discovered",
+            "connecting": "device.status.connecting",
+        }.get(headset.get("status", ""), "device.status.unknown")
+        by_key = {
+            "dongle": "device.by.dongle",
+            "bluetooth": "device.by.bluetooth",
+            "usb cable": "device.by.usb",
+            "usb": "device.by.usb",
+        }.get(str(headset.get("connectedBy", "")).lower())
+
+        line = t(status_key)
+        if by_key:
+            line += " · " + t(by_key)
+        detail = QLabel(line)
+        detail.setFont(QFont("Segoe UI", 10))
+        detail.setStyleSheet("color: #4f5d75; border: none;")
+        text_column.addWidget(detail)
+
+        if info["channels"]:
+            channels = QLabel(t("device.channels", count=len(info["channels"]),
+                                names=", ".join(info["channels"])))
+        elif info["known"]:
+            channels = QLabel(t("device.unknown_model"))
+        else:
+            channels = QLabel(t("device.unknown_model"))
+        channels.setFont(QFont("Segoe UI", 9))
+        channels.setWordWrap(True)
+        channels.setStyleSheet("color: #94a3b8; border: none;")
+        text_column.addWidget(channels)
+
+        # The one capability difference a caregiver has to know about before
+        # they start: MN8 cannot see a clench or a furrow.
+        facial = QLabel(t("device.facial_yes") if info["has_facial"]
+                        else t("device.facial_no"))
+        facial.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        facial.setWordWrap(True)
+        facial.setStyleSheet("color: %s; border: none;" %
+                             ("#27ae60" if info["has_facial"] else "#d9145a"))
+        text_column.addWidget(facial)
+
+        row.addLayout(text_column, stretch=1)
+
+        connect_btn = QPushButton(t("device.connect"))
+        connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        connect_btn.setFixedSize(130, 42)
+        connect_btn.setStyleSheet(
+            "QPushButton { background-color: #d9145a; color: white; border-radius: 4px;"
+            "font-weight: bold; } QPushButton:hover { background-color: #b00f46; }")
+        connect_btn.clicked.connect(lambda _c=False, h=headset_id: self.choose_headset(h))
+        row.addWidget(connect_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        return card
+
+    def choose_headset(self, headset_id):
+        self.selected_headset = headset_id
+        info = devices.describe(headset_id)
+        self.device_facial_supported = info["has_facial"]
+
+        i18n.unbind(self.device_status_lbl)
+        self.device_status_lbl.setText(t("device.connecting", headset=headset_id))
+
+        # Draw the head map for this headset immediately. Cortex will confirm
+        # the real channel names on subscribe and they replace these.
+        self.head_map.set_channels(info["channels"])
+        # The setup advice differs per headset family, so it is re-rendered for
+        # the one that was just chosen.
+        self.switch_setup_tab(self.current_setup_tab)
+        self.apply_device_capabilities()
+        self.update_hardware_banner(headset_id)
+        self.quality_pill.set_device(headset_id)
+
+        if self.cortex_thread:
+            self.cortex_thread.connect_to(
+                headset_id, want_facial=self.facial_selector.isChecked())
+
+        self.page_container.setCurrentIndex(PAGE_PREFLIGHT)
+        self.update_preflight_metrics()
+
+    def apply_device_capabilities(self):
+        """Reflect what this headset can do, in the places it matters."""
+        supported = self.device_facial_supported
+        self.facial_selector.setEnabled(supported)
+        if not supported:
+            self.facial_selector.setChecked(False)
+            self.facial_selector.setToolTip(t("board.facial_unsupported"))
+            self.facial_slider.setEnabled(False)
+            self.facial_slider_lbl.setStyleSheet("color: #94a3b8; border: none;")
+        else:
+            self.facial_selector.setChecked(self.init_include_facial)
+            self.facial_selector.setToolTip("")
+            self.facial_slider.setEnabled(True)
+            self.facial_slider_lbl.setStyleSheet("color: #4f5d75; border: none;")
+        self.facial_note_lbl.setVisible(not supported)
+        self.handle_stream_selectors_toggled()
+
+    def on_headset_connected(self, headset_id):
+        if headset_id:
+            self.selected_headset = headset_id
+            self.update_hardware_banner(headset_id)
+            self.quality_pill.set_device(headset_id)
+
+    def on_stream_failed(self, stream, message):
+        self.display_network_logs("status.stream_refused",
+                                  {"stream": stream, "detail": message})
+        if stream == "fac":
+            # Cortex refusing `fac` is the authoritative answer, whatever the
+            # device table said.
+            self.device_facial_supported = False
+            self.apply_device_capabilities()
+
+    # ── screen 2: pre-flight ─────────────────────────────────────────────
     def build_preflight_screen(self):
         self.setup_page = QWidget()
         self.setup_page.setStyleSheet("background-color: #ffffff;")
         layout = QVBoxLayout(self.setup_page)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(40, 30, 40, 30)
 
         nav_header = QHBoxLayout()
-        
-        self.cq_tab_btn = QPushButton("Contact Quality")
+
+        self.preflight_back_btn = i18n.bind(QPushButton(), "nav.back")
+        self.preflight_back_btn.setFlat(True)
+        self.preflight_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.preflight_back_btn.setStyleSheet(
+            "QPushButton { color: #4f5d75; font-weight: bold; padding-right: 14px; }")
+        self.preflight_back_btn.clicked.connect(
+            lambda: self.page_container.setCurrentIndex(PAGE_DEVICES))
+        nav_header.addWidget(self.preflight_back_btn)
+
+        self.cq_tab_btn = i18n.bind(QPushButton(), "nav.contact_quality")
         self.cq_tab_btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.cq_tab_btn.setFlat(True)
         self.cq_tab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cq_tab_btn.clicked.connect(lambda: self.switch_setup_tab("CQ"))
         nav_header.addWidget(self.cq_tab_btn)
-        
-        self.eq_tab_btn = QPushButton("EEG Quality")
+
+        self.eq_tab_btn = i18n.bind(QPushButton(), "nav.eeg_quality")
         self.eq_tab_btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Medium))
         self.eq_tab_btn.setFlat(True)
         self.eq_tab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.eq_tab_btn.clicked.connect(lambda: self.switch_setup_tab("EQ"))
         nav_header.addWidget(self.eq_tab_btn)
-        
-        nav_header.addStretch()
 
-        self.phrases_btn = QPushButton("📝 Phrases")
+        nav_header.addStretch()
+        nav_header.addLayout(self.build_language_toggle())
+
+        self.phrases_btn = i18n.bind(QPushButton(), "nav.phrases")
         self.phrases_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.phrases_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.phrases_btn.setStyleSheet("QPushButton { background-color: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 4px; margin-right: 5px; } QPushButton:hover { background-color: #e2e8f0; }")
+        self.phrases_btn.setStyleSheet("QPushButton { background-color: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 4px; margin-left: 8px; } QPushButton:hover { background-color: #e2e8f0; }")
         self.phrases_btn.clicked.connect(self.open_phrase_manager_dialog)
         nav_header.addWidget(self.phrases_btn)
 
-        self.config_btn = QPushButton("⚙️ API Settings")
+        self.config_btn = i18n.bind(QPushButton(), "nav.api_settings")
         self.config_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.config_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.config_btn.setStyleSheet("QPushButton { background-color: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #e2e8f0; }")
@@ -705,24 +1239,36 @@ class BCICommunicationBoard(QMainWindow):
 
         body_layout = QHBoxLayout()
         body_layout.setSpacing(40)
-        
+
         left_column_layout = QVBoxLayout()
-        
-        self.device_name_label = QLabel("DEVICE: CONNECTING...")
+
+        self.device_name_label = i18n.bind(QLabel(), "setup.device_connecting")
         self.device_name_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.device_name_label.setStyleSheet("color: #4f5d75; background-color: #f8f9fa; padding: 8px; border-radius: 6px; border: 1px solid #e2e8f0; margin-bottom: 5px;")
         self.device_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.device_name_label.setFixedHeight(40)  
+        self.device_name_label.setFixedHeight(40)
         left_column_layout.addWidget(self.device_name_label)
 
+        left_column_layout.addStretch()
         self.head_map = HeadsetMapWidget()
         left_column_layout.addWidget(self.head_map, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.two_channel_note = i18n.bind(QLabel(), "setup.two_channel_note")
+        self.two_channel_note.setWordWrap(True)
+        self.two_channel_note.setFont(QFont("Segoe UI", 9))
+        self.two_channel_note.setStyleSheet("color: #64748b;")
+        self.two_channel_note.setVisible(False)
+        self.two_channel_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_column_layout.addWidget(self.two_channel_note)
+        left_column_layout.addStretch()
+
         body_layout.addLayout(left_column_layout)
 
         text_layout = QVBoxLayout()
         self.instructions_title = QLabel("")
         self.instructions_title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
         self.instructions_title.setStyleSheet("color: #1a1a1a;")
+        self.instructions_title.setWordWrap(True)
         text_layout.addWidget(self.instructions_title)
 
         self.instructions_body = QLabel("")
@@ -731,25 +1277,31 @@ class BCICommunicationBoard(QMainWindow):
         self.instructions_body.setStyleSheet("color: #4a5568; line-height: 150%;")
         text_layout.addWidget(self.instructions_body)
         text_layout.addStretch()
-        
+
         self.completion_percentage_label = QLabel("0%")
         self.completion_percentage_label.setFont(QFont("Segoe UI", 32, QFont.Weight.Bold))
         self.completion_percentage_label.setStyleSheet("color: #cbd5e1;")
         text_layout.addWidget(self.completion_percentage_label)
 
+        self.completion_hint_label = QLabel("")
+        self.completion_hint_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.completion_hint_label.setStyleSheet("color: #64748b;")
+        self.completion_hint_label.setWordWrap(True)
+        text_layout.addWidget(self.completion_hint_label)
+
         body_layout.addLayout(text_layout)
         layout.addLayout(body_layout, stretch=1)
 
         footer_layout = QHBoxLayout()
-        self.setup_network_log = QLabel("BCI: Waiting for connection payload sequence...")
+        self.setup_network_log = QLabel("BCI: " + t("status.waiting"))
         self.setup_network_log.setFont(QFont("Segoe UI", 10))
         footer_layout.addWidget(self.setup_network_log)
         footer_layout.addStretch()
 
-        self.continue_btn = QPushButton("Continue >")
+        self.continue_btn = i18n.bind(QPushButton(), "setup.continue")
         self.continue_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        self.continue_btn.setFixedSize(140, 42)
-        self.continue_btn.setEnabled(False) 
+        self.continue_btn.setFixedSize(160, 42)
+        self.continue_btn.setEnabled(False)
         self.continue_btn.setStyleSheet("""
             QPushButton:enabled { background-color: #d9145a; color: white; border-radius: 4px; }
             QPushButton:disabled { background-color: #e2e8f0; color: #94a3b8; border-radius: 4px; }
@@ -760,31 +1312,32 @@ class BCICommunicationBoard(QMainWindow):
 
         self.switch_setup_tab("CQ")
 
+    # ── screen 3: the board ──────────────────────────────────────────────
     def build_keyboard_screen(self):
         self.keyboard_page = QWidget()
-        self.keyboard_page.setStyleSheet("background-color: #f8fafc;") 
+        self.keyboard_page.setStyleSheet("background-color: #f8fafc;")
         self.main_layout = QVBoxLayout(self.keyboard_page)
-        
+
         self.boards = {"ALPHA": BOARD_2_ALPHA, "PHRASES": BOARD_1_PHRASES}
         self.current_board_name = "ALPHA"
         self.current_matrix = self.boards[self.current_board_name]
-        
+
         self.SCAN_ROWS = 0
         self.SCAN_COLS = 1
         self.scanning_state = self.SCAN_ROWS
-        
+
         self.active_row = 0
         self.active_col = 0
-        
-        self.scan_intervals = [2000, 1500, 1000, 600] 
-        self.speed_names = ["SLOW", "MEDIUM", "FAST", "VERY FAST"]
-        self.speed_index = 1 
+
+        self.scan_intervals = [2000, 1500, 1000, 600]
+        self.speed_keys = ["speed.slow", "speed.medium", "speed.fast", "speed.very_fast"]
+        self.speed_index = 1
         self.composed_text = ""
 
         # --- THRESHOLDS, COOLDOWN, & PAUSE STATES ---
-        self.MENTAL_THRESHOLD = 0.35      
-        self.FACIAL_THRESHOLD = 0.70      
-        self.SELECTION_COOLDOWN_MS = 2500 
+        self.MENTAL_THRESHOLD = 0.35
+        self.FACIAL_THRESHOLD = 0.70
+        self.SELECTION_COOLDOWN_MS = 2500
 
         # --- UNIFIED 0.5-SECOND SUSTAINED HOLD TIMERS ---
         self.HOLD_DURATION_SEC = 0.5
@@ -792,22 +1345,26 @@ class BCICommunicationBoard(QMainWindow):
         self.mental_active_cmd = None
         self.facial_hold_start = None
         self.facial_active_act = None
-        
-        self.latch_released = True
-        self.facial_latch_released = True 
-        self.in_cooldown = False          
-        self.is_paused = False            
-        
-        self.cooldown_remaining_ms = 0
-        self.cooldown_phase_label = ""
 
-        self.mental_state_str = "NEUTRAL (IDLING) [Power: 0.00]"
-        self.facial_state_str = "READY (IDLING)"
+        self.latch_released = True
+        self.facial_latch_released = True
+        self.in_cooldown = False
+        self.is_paused = False
+
+        self.cooldown_remaining_ms = 0
+        self.cooldown_phase_key = ""
+
+        # The live state is held as (key, params), never as rendered text:
+        # switching language has to re-say what is happening right now, not
+        # leave an English sentence frozen inside a Chinese banner.
+        self.mental_state = ("telemetry.neutral", {"power": "0.00"})
+        self.facial_state = ("telemetry.facial_ready", {})
+        self.board_status = ("status.scanner_active", {})
 
         # Message & Quick Action Control Bay
         message_bar_layout = QHBoxLayout()
 
-        self.display_box = QLabel("Composed Message: ")
+        self.display_box = QLabel(t("board.composed", text=""))
         self.display_box.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
         self.display_box.setStyleSheet("background-color: #1e1e24; color: #2ecc71; padding: 15px; border-radius: 8px; border: 2px solid #111115;")
         self.display_box.setWordWrap(True)
@@ -816,33 +1373,33 @@ class BCICommunicationBoard(QMainWindow):
         action_btn_layout = QVBoxLayout()
         action_btn_layout.setSpacing(6)
 
-        self.speak_btn = QPushButton("🔊 SPEAK")
+        self.speak_btn = i18n.bind(QPushButton(), "board.speak")
         self.speak_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        self.speak_btn.setFixedSize(130, 36)
+        self.speak_btn.setFixedSize(150, 36)
         self.speak_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.speak_btn.setStyleSheet("QPushButton { background-color: #d9145a; color: white; border-radius: 6px; } QPushButton:hover { background-color: #b00f46; }")
         self.speak_btn.clicked.connect(self.speak_message)
         action_btn_layout.addWidget(self.speak_btn)
 
-        self.backspace_btn = QPushButton("⌫ BACKSPACE")
+        self.backspace_btn = i18n.bind(QPushButton(), "board.backspace")
         self.backspace_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.backspace_btn.setFixedSize(130, 30)
+        self.backspace_btn.setFixedSize(150, 30)
         self.backspace_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backspace_btn.setStyleSheet("QPushButton { background-color: #4f5d75; color: white; border-radius: 6px; } QPushButton:hover { background-color: #3b4758; }")
         self.backspace_btn.clicked.connect(lambda: self.process_selection("BACKSPACE"))
         action_btn_layout.addWidget(self.backspace_btn)
 
-        self.pause_btn = QPushButton("⏸️ PAUSE")
+        self.pause_btn = i18n.bind(QPushButton(), "board.pause")
         self.pause_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.pause_btn.setFixedSize(130, 30)
+        self.pause_btn.setFixedSize(150, 30)
         self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pause_btn.setStyleSheet("QPushButton { background-color: #f39c12; color: white; border-radius: 6px; } QPushButton:hover { background-color: #d35400; }")
         self.pause_btn.clicked.connect(lambda: self.process_selection("PAUSE SCANNER"))
         action_btn_layout.addWidget(self.pause_btn)
 
-        self.exit_app_btn = QPushButton("✕ EXIT APP")
+        self.exit_app_btn = i18n.bind(QPushButton(), "board.exit")
         self.exit_app_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.exit_app_btn.setFixedSize(130, 30)
+        self.exit_app_btn.setFixedSize(150, 30)
         self.exit_app_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.exit_app_btn.setStyleSheet("QPushButton { background-color: #e74c3c; color: white; border-radius: 6px; } QPushButton:hover { background-color: #c0392b; }")
         self.exit_app_btn.clicked.connect(self.close)
@@ -856,13 +1413,27 @@ class BCICommunicationBoard(QMainWindow):
         self.telemetry_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.main_layout.addWidget(self.telemetry_label)
 
+        # Live headset quality, so a drifting sensor is visible without leaving
+        # the board.
+        quality_row = QHBoxLayout()
+        self.quality_pill = QualityPill()
+        quality_row.addWidget(self.quality_pill)
+
+        self.quality_warning_lbl = QLabel("")
+        self.quality_warning_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.quality_warning_lbl.setStyleSheet("color: #d9145a;")
+        self.quality_warning_lbl.setVisible(False)
+        quality_row.addWidget(self.quality_warning_lbl)
+        quality_row.addStretch()
+        self.main_layout.addLayout(quality_row)
+
         # Tuning Bar
         tuning_panel = QWidget()
         tuning_panel.setStyleSheet("background-color: #ffffff; border-radius: 6px; border: 1px solid #e2e8f0;")
         tuning_layout = QHBoxLayout(tuning_panel)
         tuning_layout.setContentsMargins(15, 6, 15, 6)
 
-        self.mental_slider_lbl = QLabel(f"Mental Cmd Sens: {self.MENTAL_THRESHOLD:.2f}")
+        self.mental_slider_lbl = QLabel(t("board.mental_sens", value=f"{self.MENTAL_THRESHOLD:.2f}"))
         self.mental_slider_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.mental_slider_lbl.setStyleSheet("color: #4f5d75; border: none;")
         tuning_layout.addWidget(self.mental_slider_lbl)
@@ -877,7 +1448,7 @@ class BCICommunicationBoard(QMainWindow):
 
         tuning_layout.addSpacing(20)
 
-        self.facial_slider_lbl = QLabel(f"Facial Sens: {self.FACIAL_THRESHOLD:.2f}")
+        self.facial_slider_lbl = QLabel(t("board.facial_sens", value=f"{self.FACIAL_THRESHOLD:.2f}"))
         self.facial_slider_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.facial_slider_lbl.setStyleSheet("color: #4f5d75; border: none;")
         tuning_layout.addWidget(self.facial_slider_lbl)
@@ -892,73 +1463,75 @@ class BCICommunicationBoard(QMainWindow):
 
         tuning_layout.addSpacing(20)
 
-        self.cooldown_slider_lbl = QLabel(f"Cooldown: {self.SELECTION_COOLDOWN_MS/1000:.1f}s")
+        self.cooldown_slider_lbl = QLabel(t("board.cooldown", value=f"{self.SELECTION_COOLDOWN_MS/1000:.1f}"))
         self.cooldown_slider_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.cooldown_slider_lbl.setStyleSheet("color: #4f5d75; border: none;")
         tuning_layout.addWidget(self.cooldown_slider_lbl)
 
         self.cooldown_slider = QSlider(Qt.Orientation.Horizontal)
-        self.cooldown_slider.setRange(5, 50) 
+        self.cooldown_slider.setRange(5, 50)
         self.cooldown_slider.setValue(int(self.SELECTION_COOLDOWN_MS / 100))
         self.cooldown_slider.setFixedWidth(110)
         self.cooldown_slider.setStyleSheet("QSlider::handle:horizontal { background-color: #d9145a; border-radius: 5px; }")
         self.cooldown_slider.valueChanged.connect(self.handle_cooldown_slider_changed)
         tuning_layout.addWidget(self.cooldown_slider)
-        
+
         tuning_layout.addStretch()
+
+        self.facial_note_lbl = i18n.bind(QLabel(), "board.facial_unsupported")
+        self.facial_note_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.facial_note_lbl.setStyleSheet("color: #d9145a; border: none;")
+        self.facial_note_lbl.setVisible(False)
+        tuning_layout.addWidget(self.facial_note_lbl)
+
         self.main_layout.addWidget(tuning_panel)
 
         self.grid_container = QWidget()
         self.grid_layout = QGridLayout(self.grid_container)
         self.main_layout.addWidget(self.grid_container, stretch=1)
-        
+
         self.build_board_grid()
-        
+
         status_layout = QHBoxLayout()
-        self.status_label = QLabel("Mode: AUTOMATIC SCAN")
+        self.status_label = i18n.bind(QLabel(), "board.mode")
         self.status_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.status_label.setStyleSheet("color: #1e293b; padding-right: 10px;")
         status_layout.addWidget(self.status_label)
-        
-        speed_title = QLabel("Speed: ")
+
+        speed_title = i18n.bind(QLabel(), "board.speed")
         speed_title.setFont(QFont("Segoe UI", 11))
         status_layout.addWidget(speed_title)
-        
+
         self.speed_widgets = []
-        for name in self.speed_names:
-            lbl = QLabel(name)
+        for key in self.speed_keys:
+            lbl = i18n.bind(QLabel(), key)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
             lbl.setFixedSize(85, 22)
             status_layout.addWidget(lbl)
             self.speed_widgets.append(lbl)
-            
+
         status_layout.addStretch()
 
-        self.mental_selector = QCheckBox("Include Mental Commands")
+        self.mental_selector = i18n.bind(QCheckBox(), "board.include_mental")
         self.mental_selector.setChecked(self.init_include_mental)
         self.mental_selector.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
         self.mental_selector.setStyleSheet("QCheckBox { color: #334155; spacing: 4px; padding-right: 10px; }")
         self.mental_selector.toggled.connect(self.handle_stream_selectors_toggled)
         status_layout.addWidget(self.mental_selector)
 
-        self.facial_selector = QCheckBox("Include Facial Expressions")
-        self.facial_selector.setChecked(self.init_include_facial) 
+        self.facial_selector = i18n.bind(QCheckBox(), "board.include_facial")
+        self.facial_selector.setChecked(self.init_include_facial)
         self.facial_selector.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
         self.facial_selector.setStyleSheet("QCheckBox { color: #334155; spacing: 4px; padding-right: 15px; }")
         self.facial_selector.toggled.connect(self.handle_stream_selectors_toggled)
         status_layout.addWidget(self.facial_selector)
 
-        self.keyboard_diagnostics_label = QLabel("🔋 --%  📶 --%")
-        self.keyboard_diagnostics_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.keyboard_diagnostics_label.setStyleSheet("color: #4f5d75; padding-right: 10px;")
-        status_layout.addWidget(self.keyboard_diagnostics_label)
-
-        self.keyboard_network_status_label = QLabel("BCI: Active.")
+        self.keyboard_network_status_label = QLabel()
         self.keyboard_network_status_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.keyboard_network_status_label.setStyleSheet("color: #2ecc71; padding-right: 10px;")
         status_layout.addWidget(self.keyboard_network_status_label)
-        
+        self.set_board_status("status.scanner_active", "#2ecc71")
+
         self.controls_label = QLabel("")
         self.controls_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.controls_label.setStyleSheet("color: #4f5d75; padding: 5px;")
@@ -974,45 +1547,55 @@ class BCICommunicationBoard(QMainWindow):
         self.cooldown_ticker.timeout.connect(self.tick_cooldown_countdown)
 
         self.update_telemetry_box("neutral")
+        self.update_status_bar()
 
+    # ── live device state ────────────────────────────────────────────────
     def update_device_diagnostics(self, battery_pct, signal_pct):
-        batt_color = "#2ecc71" if battery_pct > 50 else ("#f39c12" if battery_pct > 20 else "#d9145a")
-        diag_text = f"🔋 {battery_pct}%   📶 {signal_pct}%"
-        
-        self.keyboard_diagnostics_label.setText(diag_text)
-        self.keyboard_diagnostics_label.setStyleSheet(f"color: {batt_color}; font-weight: bold; padding-right: 10px;")
+        self.battery_percent = battery_pct
+        self.quality_pill.set_battery(battery_pct)
 
-        current_dev = self.device_name_label.text().split("  |  ")[0]
-        self.device_name_label.setText(f"{current_dev}  |  {diag_text}")
+    def refresh_quality_pill(self):
+        self.quality_pill.set_device(self.selected_headset)
+        self.quality_pill.set_contact(self.contact_percent)
+        self.quality_pill.set_eeg(self.eeg_percent)
+        self.quality_pill.set_battery(self.battery_percent)
 
     def handle_mental_slider_changed(self, value):
         self.MENTAL_THRESHOLD = value / 100.0
-        self.mental_slider_lbl.setText(f"Mental Cmd Sens: {self.MENTAL_THRESHOLD:.2f}")
+        self.mental_slider_lbl.setText(
+            t("board.mental_sens", value=f"{self.MENTAL_THRESHOLD:.2f}"))
         self.update_telemetry_box("neutral")
 
     def handle_facial_slider_changed(self, value):
         self.FACIAL_THRESHOLD = value / 100.0
-        self.facial_slider_lbl.setText(f"Facial Sens: {self.FACIAL_THRESHOLD:.2f}")
+        self.facial_slider_lbl.setText(
+            t("board.facial_sens", value=f"{self.FACIAL_THRESHOLD:.2f}"))
         self.update_telemetry_box("neutral")
 
     def handle_cooldown_slider_changed(self, value):
         self.SELECTION_COOLDOWN_MS = value * 100
-        self.cooldown_slider_lbl.setText(f"Cooldown: {self.SELECTION_COOLDOWN_MS/1000:.1f}s")
+        self.cooldown_slider_lbl.setText(
+            t("board.cooldown", value=f"{self.SELECTION_COOLDOWN_MS/1000:.1f}"))
 
     def update_telemetry_box(self, style_preset="neutral"):
         if self.in_cooldown:
             return
 
-        mental_part = self.mental_state_str if self.mental_selector.isChecked() else "DISABLED"
-        text = f"BCI FRAMEWORK — MENTAL COMMAND INTENT: {mental_part}"
-        
-        if self.facial_selector.isChecked():
-            text += f"   |   FACIAL EMG STATE: {self.facial_state_str}"
+        if self.mental_selector.isChecked():
+            mental_part = t(self.mental_state[0], **self.mental_state[1])
         else:
-            text += f"   |   FACIAL EMG STATE: DISABLED"
-        
-        self.telemetry_label.setText(text)
-        
+            mental_part = t("telemetry.disabled")
+
+        if not self.device_facial_supported:
+            facial_part = t("telemetry.unsupported")
+        elif self.facial_selector.isChecked():
+            facial_part = t(self.facial_state[0], **self.facial_state[1])
+        else:
+            facial_part = t("telemetry.disabled")
+
+        self.telemetry_label.setText(
+            t("telemetry.line", mental=mental_part, facial=facial_part))
+
         if style_preset == "neutral":
             self.telemetry_label.setStyleSheet("background-color: #1e1e24; color: #edf2f4; padding: 10px; border-radius: 6px; margin-top: 5px; border: 1px solid #334155;")
         elif style_preset == "warning":
@@ -1024,36 +1607,38 @@ class BCICommunicationBoard(QMainWindow):
         elif style_preset == "facial_trigger":
             self.telemetry_label.setStyleSheet("background-color: #4f5d75; color: #ffffff; padding: 10px; border-radius: 6px; margin-top: 5px; border: 1px solid #2b2d42;")
 
+    def set_board_status(self, key, colour, **params):
+        """The line under the board, kept as a key so it can be re-said."""
+        self.board_status = (key, params)
+        self.keyboard_network_status_label.setText("BCI: " + t(key, **params))
+        self.keyboard_network_status_label.setStyleSheet(
+            f"color: {colour}; font-weight: bold;")
+
     def handle_stream_selectors_toggled(self):
         m_on = self.mental_selector.isChecked()
-        f_on = self.facial_selector.isChecked()
+        f_on = self.facial_selector.isChecked() and self.device_facial_supported
 
-        sel_t = self.select_thought.capitalize()
-        sel_f = self.select_facial.capitalize()
-        spd_t = self.speed_thought.capitalize()
-        spd_f = self.speed_facial.capitalize()
+        params = {
+            "select_thought": self.select_thought.capitalize(),
+            "select_facial": self.select_facial.capitalize(),
+            "speed_thought": self.speed_thought.capitalize(),
+            "speed_facial": self.speed_facial.capitalize(),
+        }
 
         if m_on and f_on:
-            self.controls_label.setText(f"{sel_t}/{sel_f} = SELECT  •  {spd_t}/{spd_f} = SPEED")
-        elif m_on and not f_on:
-            self.controls_label.setText(f"{sel_t} = SELECT  •  {spd_t} = SPEED")
-        elif not m_on and f_on:
-            self.controls_label.setText(f"{sel_f} = SELECT  •  {spd_f} = SPEED")
+            self.controls_label.setText(t("controls.both", **params))
+        elif m_on:
+            self.controls_label.setText(t("controls.mental", **params))
+        elif f_on:
+            self.controls_label.setText(t("controls.facial", **params))
         else:
-            self.controls_label.setText("ALL BCI OVERRIDES DISABLED")
+            self.controls_label.setText(t("controls.none"))
 
-        # Persist checkbox state directly to config.json
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = json.load(f)
-                cfg["include_mental_commands"] = m_on
-                cfg["include_facial_expressions"] = f_on
-                with open(CONFIG_PATH, "w") as f:
-                    json.dump(cfg, f, indent=4)
-            except Exception:
-                pass
-            
+        save_config({
+            "include_mental_commands": m_on,
+            "include_facial_expressions": self.facial_selector.isChecked(),
+        })
+
         self.update_telemetry_box("neutral")
 
     def build_board_grid(self):
@@ -1061,13 +1646,15 @@ class BCICommunicationBoard(QMainWindow):
             child = self.grid_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
-                
+
         self.grid_widgets = []
         for r in range(len(self.current_matrix)):
             row_widgets = []
             for c in range(len(self.current_matrix[r])):
-                text = self.current_matrix[r][c]
-                label = QLabel(text)
+                token = self.current_matrix[r][c]
+                # The cell carries the token; the label is only what it looks
+                # like in the language currently selected.
+                label = QLabel(i18n.cell(token) if token else "")
                 label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 label.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
                 label.setWordWrap(True)
@@ -1080,80 +1667,119 @@ class BCICommunicationBoard(QMainWindow):
         self.current_setup_tab = mode
         self.head_map.display_mode = mode
         self.head_map.update()
-        
+
         if mode == "CQ":
             self.cq_tab_btn.setStyleSheet("background: transparent; color: #d9145a; border-bottom: 3px solid #d9145a; padding-bottom: 3px; font-weight: bold;")
             self.eq_tab_btn.setStyleSheet("background: transparent; color: #94a3b8; border-bottom: 3px solid transparent; padding-bottom: 3px; font-weight: normal;")
-            self.instructions_title.setText("How to ensure good Contact Quality?")
-            self.instructions_body.setText(
-                "Work each sensor underneath hair to make contact with the scalp. "
-                "If all sensors are black, first adjust the reference sensors (the two pointy cones "
-                "on the arm behind the left ear) until they are green, and then adjust the other sensors."
-            )
+            self.instructions_title.setText(t("setup.cq_title"))
+            self.instructions_body.setText(self.contact_guidance())
         else:
             self.eq_tab_btn.setStyleSheet("background: transparent; color: #d9145a; border-bottom: 3px solid #d9145a; padding-bottom: 3px; font-weight: bold;")
             self.cq_tab_btn.setStyleSheet("background: transparent; color: #94a3b8; border-bottom: 3px solid transparent; padding-bottom: 3px; font-weight: normal;")
-            self.instructions_title.setText("How to ensure stable EEG Quality?")
-            self.instructions_body.setText(
-                "EEG Quality tracks electrical noise and data saturation. Keep your facial muscles relaxed, "
-                "minimize jaw clenching, and try to limit sudden movements.\n\n"
-                "• Black nodes indicate heavy ambient signal noise or sensor saturation.\n"
-                "• Orange nodes indicate moderate line-noise artifact interference.\n"
-                "• Green nodes mean clean, pristine brainwave signals are flowing successfully."
-            )
+            self.instructions_title.setText(t("setup.eq_title"))
+            self.instructions_body.setText(t("setup.eq_body"))
         self.update_preflight_metrics()
 
+    def contact_guidance(self) -> str:
+        """The advice that matches the headset actually in use.
+
+        Insight's reference sensors are two cones behind the left ear, EPOC's
+        are felt pads that need saline, and MN8's sensors are in the earpieces.
+        Printing one of those three sets of instructions for all of them is how
+        a caregiver ends up looking for a part their headset does not have.
+        """
+        prefix = devices.describe(self.selected_headset)["prefix"]
+        family = {
+            "INSIGHT": "insight", "INSIGHT2": "insight",
+            "EPOC": "epoc", "EPOCPLUS": "epoc", "EPOCX": "epoc",
+            "EPOCFLEX": "epoc", "FLEX": "epoc", "FLEX2": "epoc",
+            "MN8": "mn8",
+        }.get(prefix)
+        if not family:
+            return t("setup.cq_body")
+        return t("setup.cq_body." + family)
+
     def process_contact_quality(self, cq_map):
-        self.head_map.cq_status.update(cq_map)
-        self.head_map.update()
+        self.head_map.update_quality("CQ", cq_map)
+        self.contact_percent = devices.quality_percent(self.head_map.cq_status.values())
+        self.quality_pill.set_contact(self.contact_percent)
+        self.update_quality_warning()
         self.update_preflight_metrics()
 
     def process_eeg_quality(self, eq_map):
-        self.head_map.eq_status.update(eq_map)
-        self.head_map.update()
+        self.head_map.update_quality("EQ", eq_map)
+        self.eeg_percent = devices.quality_percent(self.head_map.eq_status.values())
+        self.quality_pill.set_eeg(self.eeg_percent)
         self.update_preflight_metrics()
 
-    def update_preflight_metrics(self):
-        stable_cq = sum(1 for val in self.head_map.cq_status.values() if val >= 3)
-        stable_eq = sum(1 for val in self.head_map.eq_status.values() if val >= 3)
-        total = len(self.head_map.cq_status)
-        
-        cq_pct = int((stable_cq / total) * 100)
-        eq_pct = int((stable_eq / total) * 100)
-        
-        if self.current_setup_tab == "CQ":
-            self.completion_percentage_label.setText(f"{cq_pct}%")
+    def update_quality_warning(self):
+        """Name the sensors that went bad, while the board is in use.
+
+        Saying "contact 60%" during a session is not actionable; saying which
+        electrode to push back down is.
+        """
+        weak = devices.weak_sensors(self.head_map.cq_status)
+        if weak and self.page_container.currentIndex() == PAGE_BOARD:
+            self.quality_warning_lbl.setText(t("pill.warning", names=", ".join(weak)))
+            self.quality_warning_lbl.setVisible(True)
         else:
-            self.completion_percentage_label.setText(f"{eq_pct}%")
-            
-        if cq_pct == 100 and eq_pct == 100:
+            self.quality_warning_lbl.setVisible(False)
+
+    def update_preflight_metrics(self):
+        cq_pct = devices.quality_percent(self.head_map.cq_status.values())
+        eq_pct = devices.quality_percent(self.head_map.eq_status.values())
+        total = len(self.head_map.cq_status) or 0
+
+        self.two_channel_note.setVisible(0 < total <= 2)
+
+        shown = cq_pct if self.current_setup_tab == "CQ" else eq_pct
+        self.completion_percentage_label.setText(f"{shown}%")
+
+        missing = len(devices.weak_sensors(self.head_map.cq_status))
+        if total and cq_pct == 100 and eq_pct == 100:
             self.completion_percentage_label.setStyleSheet("color: #2ecc71;")
+            self.completion_hint_label.setText(t("setup.ready"))
             self.continue_btn.setEnabled(True)
         else:
             self.completion_percentage_label.setStyleSheet("color: #cbd5e1;")
+            if not total:
+                self.completion_hint_label.setText("")
+            elif missing == 1:
+                self.completion_hint_label.setText(t("setup.waiting_one"))
+            else:
+                self.completion_hint_label.setText(
+                    t("setup.waiting_many", count=missing))
             self.continue_btn.setEnabled(False)
 
     def update_hardware_banner(self, device_id):
-        self.device_name_label.setText(f"DEVICE: {device_id.upper()}")
+        i18n.unbind(self.device_name_label)
+        self.device_name_label.setText(t("setup.device", headset=device_id.upper()))
         self.device_name_label.setStyleSheet("color: #2ecc71; background-color: #f8f9fa; padding: 8px; border-radius: 6px; border: 1px solid #2ecc71; font-weight: bold;")
 
     def transition_to_keyboard(self):
-        self.page_container.setCurrentIndex(1)
+        self.page_container.setCurrentIndex(PAGE_BOARD)
         self.timer.start(self.scan_intervals[self.speed_index])
         self.update_ui_highlights()
         self.update_status_bar()
+        self.refresh_quality_pill()
 
-    def display_network_logs(self, text):
+    def display_network_logs(self, code, params=None):
+        text = t(code, **(params or {}))
         self.setup_network_log.setText(f"BCI: {text}")
-        if "Active" in text or "Monitoring" in text:
+        if code in ("status.live", "status.linked"):
             self.setup_network_log.setStyleSheet("color: #27ae60; font-weight: bold;")
-        elif "Failed" in text or "Missing" in text:
+        elif code in ("status.failed", "status.no_cortex_file", "status.config_error",
+                      "status.stream_refused"):
             self.setup_network_log.setStyleSheet("color: #d9145a; font-weight: bold;")
         else:
             self.setup_network_log.setStyleSheet("color: #f39c12; font-weight: bold;")
 
+        if code == "status.live" and self.device_status_lbl:
+            i18n.unbind(self.device_status_lbl)
+            self.device_status_lbl.setText(text)
+
     def route_bci_command(self, command, power):
-        if self.page_container.currentIndex() != 1 or self.in_cooldown or self.is_paused:
+        if self.page_container.currentIndex() != PAGE_BOARD or self.in_cooldown or self.is_paused:
             self.mental_hold_start = None
             self.mental_active_cmd = None
             return
@@ -1168,7 +1794,7 @@ class BCICommunicationBoard(QMainWindow):
         if clean_command == "neutral":
             self.mental_hold_start = None
             self.mental_active_cmd = None
-            self.mental_state_str = f"NEUTRAL (IDLING) [Power: {power:.2f}]"
+            self.mental_state = ("telemetry.neutral", {"power": f"{power:.2f}"})
             self.update_telemetry_box("neutral")
             self.latch_released = True
             return
@@ -1181,12 +1807,14 @@ class BCICommunicationBoard(QMainWindow):
             self.mental_active_cmd = None
             return
 
-        mapped_action = "SELECT" if is_select_cmd else "CHANGE SPEED"
+        mapped_action = t("action.select") if is_select_cmd else t("action.speed")
 
         if power < self.MENTAL_THRESHOLD:
             self.mental_hold_start = None
             self.mental_active_cmd = None
-            self.mental_state_str = f"{clean_command.upper()} ({mapped_action}) [Power: {power:.2f}] (Below Threshold)"
+            self.mental_state = ("telemetry.below",
+                                 {"command": clean_command.upper(),
+                                  "action": mapped_action, "power": f"{power:.2f}"})
             self.update_telemetry_box("warning")
             self.latch_released = True
             return
@@ -1194,7 +1822,9 @@ class BCICommunicationBoard(QMainWindow):
         if not self.latch_released:
             self.mental_hold_start = None
             self.mental_active_cmd = None
-            self.mental_state_str = f"{clean_command.upper()} ({mapped_action}) [Power: {power:.2f}] (LOCKED)"
+            self.mental_state = ("telemetry.locked",
+                                 {"command": clean_command.upper(),
+                                  "action": mapped_action, "power": f"{power:.2f}"})
             self.update_telemetry_box("locked")
             return
 
@@ -1206,10 +1836,15 @@ class BCICommunicationBoard(QMainWindow):
         elapsed = time.time() - self.mental_hold_start
 
         if elapsed < self.HOLD_DURATION_SEC:
-            self.mental_state_str = f"HOLDING {clean_command.upper()} ({mapped_action})... ({elapsed:.1f}s / {self.HOLD_DURATION_SEC:.1f}s)"
+            self.mental_state = ("telemetry.holding",
+                                 {"command": clean_command.upper(),
+                                  "action": mapped_action, "elapsed": f"{elapsed:.1f}",
+                                  "needed": f"{self.HOLD_DURATION_SEC:.1f}"})
             self.update_telemetry_box("warning")
         else:
-            self.mental_state_str = f"TRIGGERED {clean_command.upper()}! [Power: {power:.2f}]"
+            self.mental_state = ("telemetry.triggered",
+                                 {"command": clean_command.upper(),
+                                  "power": f"{power:.2f}"})
             self.update_telemetry_box("mental_trigger")
             self.latch_released = False
             self.mental_hold_start = None
@@ -1221,12 +1856,12 @@ class BCICommunicationBoard(QMainWindow):
                 self.trigger_speed_change()
 
     def route_facial_command(self, u_act, u_pow, l_act, l_pow):
-        if self.page_container.currentIndex() != 1 or self.in_cooldown or self.is_paused:
+        if self.page_container.currentIndex() != PAGE_BOARD or self.in_cooldown or self.is_paused:
             self.facial_hold_start = None
             self.facial_active_act = None
             return
 
-        if not self.facial_selector.isChecked():
+        if not self.facial_selector.isChecked() or not self.device_facial_supported:
             self.facial_hold_start = None
             self.facial_active_act = None
             return
@@ -1253,8 +1888,8 @@ class BCICommunicationBoard(QMainWindow):
             self.facial_hold_start = None
             self.facial_active_act = None
             self.facial_latch_released = True
-            if self.facial_state_str != "READY (IDLING)":
-                self.facial_state_str = "READY (IDLING)"
+            if self.facial_state[0] != "telemetry.facial_ready":
+                self.facial_state = ("telemetry.facial_ready", {})
                 self.update_telemetry_box("neutral")
             return
 
@@ -1273,14 +1908,19 @@ class BCICommunicationBoard(QMainWindow):
 
         elapsed = time.time() - self.facial_hold_start
         act_name = active_target.upper()
-        action_label = "SELECT" if is_select else "SPEED"
+        action_label = t("action.select") if is_select else t("action.speed_short")
 
         if elapsed < self.HOLD_DURATION_SEC:
-            self.facial_state_str = f"HOLDING {act_name} ({action_label})... ({elapsed:.1f}s / {self.HOLD_DURATION_SEC:.1f}s)"
+            self.facial_state = ("telemetry.holding",
+                                 {"command": act_name, "action": action_label,
+                                  "elapsed": f"{elapsed:.1f}",
+                                  "needed": f"{self.HOLD_DURATION_SEC:.1f}"})
             self.update_telemetry_box("warning")
         else:
             pow_val = l_pow if (l_act_clean == active_target) else u_pow
-            self.facial_state_str = f"TRIGGERED {act_name} ({action_label} BACKUP)! [Power: {pow_val:.2f}]"
+            self.facial_state = ("telemetry.triggered_facial",
+                                 {"command": act_name, "action": action_label,
+                                  "power": f"{pow_val:.2f}"})
             self.update_telemetry_box("facial_trigger")
             self.facial_latch_released = False
             self.facial_hold_start = None
@@ -1304,12 +1944,14 @@ class BCICommunicationBoard(QMainWindow):
             for c in range(len(self.grid_widgets[r])):
                 widget = self.grid_widgets[r][c]
                 if not widget: continue
-                
-                text = widget.text()
-                is_flip_button = (text == "FLIP OVER")
+
+                # Read the TOKEN from the matrix, never the visible label: the
+                # label changes with the language, the token never does.
+                token = self.current_matrix[r][c]
+                is_flip_button = (token == "FLIP OVER")
                 is_starter_col = (self.current_board_name == "PHRASES" and c == 0)
-                is_special_action = (text in ["BACKSPACE", "SPEAK", "PAUSE SCANNER", "CLEAR MESSAGE"])
-                
+                is_special_action = (token in ["BACKSPACE", "SPEAK", "PAUSE SCANNER", "CLEAR MESSAGE"])
+
                 base_style = "border: 1px solid #e2e8f0; background-color: #ffffff; color: #1e293b; border-radius: 6px; padding: 5px;"
                 if is_starter_col:
                     base_style = "border: 1px dashed #4f5d75; background-color: #f1f5f9; color: #4f5d75; font-weight: bold; border-radius: 6px; padding: 5px;"
@@ -1323,7 +1965,7 @@ class BCICommunicationBoard(QMainWindow):
                         widget.setStyleSheet("border: 2px solid #d9145a; background-color: #fdf2f8; color: #1e1e24; border-radius: 6px; padding: 5px;")
                     else:
                         widget.setStyleSheet(base_style)
-                
+
                 elif self.scanning_state == self.SCAN_COLS:
                     if r == self.active_row and c == self.active_col:
                         widget.setStyleSheet("border: 2px solid #b00f46; background-color: #d9145a; color: #ffffff; font-weight: bold; border-radius: 6px; padding: 5px;")
@@ -1334,17 +1976,19 @@ class BCICommunicationBoard(QMainWindow):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
-            if self.page_container.currentIndex() == 0:
-                self.continue_btn.setEnabled(True)
-                self.process_contact_quality({"AF3": 4, "AF4": 4, "T7": 4, "T8": 4, "Pz": 4})
-                self.process_eeg_quality({"AF3": 4, "AF4": 4, "T7": 4, "T8": 4, "Pz": 4})
-            else:
+            if self.page_container.currentIndex() == PAGE_PREFLIGHT:
+                # Keyboard override for setting up without a headset on.
+                channels = self.head_map.channels or devices.INSIGHT_CHANNELS
+                self.head_map.set_channels(channels)
+                self.process_contact_quality({c: 4 for c in channels})
+                self.process_eeg_quality({c: 4 for c in channels})
+            elif self.page_container.currentIndex() == PAGE_BOARD:
                 if not self.in_cooldown and not self.is_paused:
                     self.trigger_select_event()
-        elif event.key() == Qt.Key.Key_S and self.page_container.currentIndex() == 1:
+        elif event.key() == Qt.Key.Key_S and self.page_container.currentIndex() == PAGE_BOARD:
             if not self.in_cooldown and not self.is_paused:
                 self.trigger_speed_change()
-        elif event.key() == Qt.Key.Key_P and self.page_container.currentIndex() == 1:
+        elif event.key() == Qt.Key.Key_P and self.page_container.currentIndex() == PAGE_BOARD:
             self.process_selection("PAUSE SCANNER")
 
     def trigger_select_event(self):
@@ -1352,23 +1996,23 @@ class BCICommunicationBoard(QMainWindow):
             self.scanning_state = self.SCAN_COLS
             self.active_col = 0
             self.update_ui_highlights()
-            self.start_cooldown_phase("Row Locked")
+            self.start_cooldown_phase("phase.row_locked")
 
         elif self.scanning_state == self.SCAN_COLS:
-            selected_text = self.current_matrix[self.active_row][self.active_col]
-            self.process_selection(selected_text)
-            
+            selected_token = self.current_matrix[self.active_row][self.active_col]
+            self.process_selection(selected_token)
+
             self.scanning_state = self.SCAN_ROWS
             self.active_row = 0
             self.update_ui_highlights()
-            self.start_cooldown_phase("Selection Complete")
+            self.start_cooldown_phase("phase.selection_complete")
 
-    def start_cooldown_phase(self, label_text):
+    def start_cooldown_phase(self, phase_key):
         self.in_cooldown = True
-        self.timer.stop() 
-        self.cooldown_phase_label = label_text
+        self.timer.stop()
+        self.cooldown_phase_key = phase_key
         self.cooldown_remaining_ms = self.SELECTION_COOLDOWN_MS
-        
+
         self.render_cooldown_in_state_tracker()
         self.cooldown_ticker.start(100)
 
@@ -1382,13 +2026,12 @@ class BCICommunicationBoard(QMainWindow):
 
     def render_cooldown_in_state_tracker(self):
         sec_str = f"{self.cooldown_remaining_ms/1000:.1f}"
-        text = f"⏳ BCI PAUSE — [{self.cooldown_phase_label.upper()}]  |  RESUMING IN {sec_str}s  (RELAX MIND / FACE)"
-        
-        self.telemetry_label.setText(text)
+        self.telemetry_label.setText(t("telemetry.cooldown",
+                                       phase=t(self.cooldown_phase_key),
+                                       seconds=sec_str))
         self.telemetry_label.setStyleSheet("background-color: #d9145a; color: #ffffff; padding: 10px; border-radius: 6px; margin-top: 5px; border: 1px solid #b00f46; font-size: 12px; font-weight: bold;")
-        
-        self.keyboard_network_status_label.setText(f"BCI: Cooldown Active ({sec_str}s)...")
-        self.keyboard_network_status_label.setStyleSheet("color: #d9145a; font-weight: bold;")
+
+        self.set_board_status("status.cooldown", "#d9145a", seconds=sec_str)
 
     def end_selection_cooldown(self):
         self.in_cooldown = False
@@ -1398,13 +2041,12 @@ class BCICommunicationBoard(QMainWindow):
         self.mental_active_cmd = None
         self.facial_hold_start = None
         self.facial_active_act = None
-        
+
         if not self.is_paused:
-            self.keyboard_network_status_label.setText("BCI: Scanner Active.")
-            self.keyboard_network_status_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
+            self.set_board_status("status.scanner_active", "#2ecc71")
             self.timer.start(self.scan_intervals[self.speed_index])
             self.update_telemetry_box("neutral")
-            
+
         self.update_ui_highlights()
 
     def trigger_speed_change(self):
@@ -1423,66 +2065,68 @@ class BCICommunicationBoard(QMainWindow):
         """Triggers asynchronous offline TTS speech for the composed text."""
         text_to_speak = self.composed_text.strip()
         if text_to_speak:
-            self.tts_worker = TTSThread(text_to_speak)
+            self.tts_worker = TTSThread(text_to_speak, language=i18n.language())
             self.tts_worker.start()
 
-    def process_selection(self, text):
-        if not text or text.strip() == "": return
+    def process_selection(self, token):
+        if not token or token.strip() == "": return
 
-        if text == "FLIP OVER":
+        if token == "FLIP OVER":
             self.current_board_name = "PHRASES" if self.current_board_name == "ALPHA" else "ALPHA"
             self.current_matrix = self.boards[self.current_board_name]
             self.build_board_grid()
+            self.update_ui_highlights()
             self.update_status_bar()
             return
-            
-        elif text == "SPEAK":
+
+        elif token == "SPEAK":
             self.speak_message()
             return
 
-        elif text == "BACKSPACE":
+        elif token == "BACKSPACE":
             if self.composed_text:
                 self.composed_text = self.composed_text[:-1]
-            self.display_box.setText(f"Composed Message: {self.composed_text}")
+            self.display_box.setText(t("board.composed", text=self.composed_text))
             return
 
-        elif text == "PAUSE SCANNER":
+        elif token == "PAUSE SCANNER":
             self.is_paused = not self.is_paused
             if self.is_paused:
                 self.timer.stop()
-                self.pause_btn.setText("▶️ RESUME")
+                i18n.bind(self.pause_btn, "board.resume")
                 self.pause_btn.setStyleSheet("QPushButton { background-color: #2ecc71; color: white; border-radius: 6px; }")
-                self.keyboard_network_status_label.setText("BCI: Scanner PAUSED.")
-                self.keyboard_network_status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
-                self.mental_state_str = "SCANNER PAUSED"
-                self.facial_state_str = "SCANNER PAUSED"
+                self.set_board_status("status.scanner_paused", "#f39c12")
+                self.mental_state = ("telemetry.paused", {})
+                self.facial_state = ("telemetry.paused", {})
                 self.update_telemetry_box("locked")
             else:
-                self.pause_btn.setText("⏸️ PAUSE")
+                i18n.bind(self.pause_btn, "board.pause")
                 self.pause_btn.setStyleSheet("QPushButton { background-color: #f39c12; color: white; border-radius: 6px; }")
-                self.keyboard_network_status_label.setText("BCI: Scanner Active.")
-                self.keyboard_network_status_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
-                self.mental_state_str = "NEUTRAL (IDLING) [Power: 0.00]"
-                self.facial_state_str = "READY (IDLING)"
+                self.set_board_status("status.scanner_active", "#2ecc71")
+                self.mental_state = ("telemetry.neutral", {"power": "0.00"})
+                self.facial_state = ("telemetry.facial_ready", {})
                 self.update_telemetry_box("neutral")
                 self.timer.start(self.scan_intervals[self.speed_index])
             return
 
-        elif text == "SPACE":
+        elif token == "SPACE":
             self.composed_text += " "
-        elif text == "CLEAR MESSAGE":
+        elif token == "CLEAR MESSAGE":
             self.composed_text = ""
-        elif text in ["WAIT", "PLEASE GUESS"]:
-            self.composed_text += f" [{text}] "
+        elif token in ["WAIT", "PLEASE GUESS"]:
+            self.composed_text += f" [{i18n.cell(token)}] "
         else:
-            if len(text) == 1 or text == "QU":
-                self.composed_text += text
+            # What gets spoken is the label, not the token, so a Chinese board
+            # composes a Chinese sentence.
+            label = i18n.cell(token)
+            if len(token) == 1 or token == "QU":
+                self.composed_text += label
             else:
                 if self.composed_text and not self.composed_text.endswith(" "):
                     self.composed_text += " "
-                self.composed_text += text + " "
-                
-        self.display_box.setText(f"Composed Message: {self.composed_text}")
+                self.composed_text += label + " "
+
+        self.display_box.setText(t("board.composed", text=self.composed_text))
 
 def apply_app_icon(app):
     """Put the app's own mark on the window, the Dock and the taskbar.

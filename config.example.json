@@ -1,0 +1,12 @@
+{
+    "cortex_client_id": "",
+    "cortex_client_secret": "",
+    "profile_name": "",
+    "include_mental_commands": true,
+    "include_facial_expressions": true,
+    "select_thought": "push",
+    "select_facial": "clench",
+    "speed_thought": "pull",
+    "speed_facial": "furrow",
+    "language": "en"
+}

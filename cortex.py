@@ -92,11 +92,16 @@ class Cortex(Dispatcher):
                 'save_profile_done', 'get_mc_active_action_done','mc_brainmap_done', 'mc_action_sensitivity_done', 
                 'mc_training_threshold_done', 'create_record_done', 'stop_record_done','warn_cortex_stop_all_sub', 'warn_record_post_processing_done',
                 'inject_marker_done', 'update_marker_done', 'export_record_done', 'new_data_labels', 
-                'new_com_data', 'new_fe_data', 'new_eeg_data', 'new_mot_data', 'new_dev_data', 
-                'new_met_data', 'new_pow_data', 'new_sys_data']
+                'new_com_data', 'new_fe_data', 'new_eeg_data', 'new_mot_data', 'new_dev_data',
+                'new_met_data', 'new_pow_data', 'new_sys_data',
+                # Added for the scanning board: the app picks the headset itself
+                # rather than taking whichever one answered first, reads EEG
+                # quality, and needs to know when a stream was refused.
+                'headset_list_done', 'new_eq_data', 'sub_failure']
     def __init__(self, client_id, client_secret, debug_mode=False, **kwargs):
-        client_id = "NKmRCa93rUl92S17YHFYUAiBxNQqKYLmrDTNyK6C"
-        client_secret = "BQ0S8dshKks4aYcUigE7JQ9vnSfgsZfBcmzAFtf0zkm1N4WZIXOtjSggD1t6PS81lFdGdvratmJS0B7NFeo2yaXsqVBjGNBXmzRkV6LqxmOB7eHdMXDqqNwY2Mp8Ynck"  
+        # These two used to be overwritten here with a hard-coded application
+        # key, which meant the credentials a user entered were silently ignored
+        # and one key was shared by everyone. Both arguments are now honoured.
         self.session_id = ''
         self.headset_id = ''
         self.debug = debug_mode
@@ -208,14 +213,17 @@ class Cortex(Dispatcher):
                     found_headset = True
                     headset_status = status
 
+            # Hand the whole list to the app every time. Which headset is on the
+            # person's head is not something this file can know, and connecting
+            # to whichever one answered first is wrong in any room with two.
+            self.emit('headset_list_done', data=self.headset_list)
+
             if len(self.headset_list) == 0:
                 self.isHeadsetConnected = False
                 warnings.warn("No headset available. Please turn on a headset.")
             elif self.headset_id == '':
-                # set first headset is default headset
-                self.headset_id = self.headset_list[0]['id']
-                # call query headet again
-                self.query_headset()
+                # Wait for set_wanted_headset() rather than choosing one here.
+                pass
             elif found_headset == False:
                 warnings.warn("Can not found the headset " + self.headset_id + ". Please make sure the id is correct.")
             elif found_headset == True:
@@ -249,6 +257,7 @@ class Cortex(Dispatcher):
                 stream_name = stream['streamName']
                 stream_msg = stream['message']
                 print('The data stream '+ stream_name + ' is subscribed unsuccessfully. Because: ' + stream_msg)
+                self.emit('sub_failure', stream=stream_name, message=stream_msg)
         elif req_id == UNSUB_REQUEST_ID:
             for stream in result_dic['success']:
                 stream_name = stream['streamName']
@@ -406,6 +415,17 @@ class Cortex(Dispatcher):
             dev_data['batteryPercent'] = result_dic['dev'][3]
             dev_data['time'] = result_dic['time']
             self.emit('new_dev_data', data=dev_data)
+        elif result_dic.get('eq') != None:
+            # [batteryPercent, overall, sampleRateQuality, then one grade per
+            # channel] — the channel names arrive with the subscription result.
+            raw = result_dic['eq']
+            eq_data = {}
+            eq_data['batteryPercent'] = raw[0] if len(raw) > 0 else None
+            eq_data['overall'] = raw[1] if len(raw) > 1 else None
+            eq_data['sampleRateQuality'] = raw[2] if len(raw) > 2 else None
+            eq_data['eq'] = raw[3:]
+            eq_data['time'] = result_dic.get('time')
+            self.emit('new_eq_data', data=eq_data)
         elif result_dic.get('met') != None:
             met_data = {}
             met_data['met'] = result_dic['met']
@@ -633,6 +653,10 @@ class Cortex(Dispatcher):
         elif stream_name == 'dev':
             # get cq header column except battery, signal and battery percent
             data_labels = stream_cols[2]
+        elif stream_name == 'eq':
+            # drop batteryPercent, overall and sampleRateQuality; what is left
+            # is one column per electrode, in the same order as the values.
+            data_labels = stream_cols[3:]
         else:
             data_labels = stream_cols
 

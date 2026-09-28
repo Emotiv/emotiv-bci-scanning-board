@@ -2,6 +2,9 @@
 
 An interactive, dual-stream Brain-Computer Interface (BCI) communication board designed for nonverbal individuals and individuals with motor impairments. Powered by PyQt6 and the EMOTIV Cortex API, this application converts real-time EEG brain patterns (Mental Commands) and facial EMG expressions into matrix-scanning keyboard selections and text-to-speech outputs.
 
+Works with **any EMOTIV headset** — Insight (5 sensors), EPOC / EPOC+ / EPOC X
+(14) and MN8 (2) — and the interface is available in **English and 中文**.
+
 ---
 
 ## 📥 Install and set up
@@ -14,7 +17,7 @@ working on the code, skip to
 
 | | |
 | :--- | :--- |
-| **An EMOTIV headset** | Insight, EPOC, EPOC+ or EPOC X. The board reads mental commands and facial expressions, so any of them works. |
+| **An EMOTIV headset** | Insight, EPOC, EPOC+, EPOC X, Flex or MN8. The board reads mental commands from all of them. **MN8 has no facial-expression stream**, so on MN8 the board runs on mental commands alone and says so on screen. |
 | **An EMOTIV account** | Free, at [emotiv.com](https://www.emotiv.com/). The Launcher and your API credentials both hang off it. |
 | **EMOTIV Launcher** | The desktop program that talks to the headset and runs the Cortex service the app connects to. Download it from your account, install it, and **sign in**. |
 | **A computer** | Windows 10/11, or a Mac with Apple Silicon. There is no phone version — the Launcher is a desktop program. |
@@ -90,8 +93,21 @@ or the app cannot reach Cortex.
    trained **profile** you want to use.
 4. Choose which inputs you want under **Include Mental Commands** and **Include
    Facial Expressions**, and which action each one triggers.
-5. Press OK. The board connects and the preflight screen shows live contact and
-   EEG quality.
+5. Press OK. The board lists every headset the Launcher can see — pick the one
+   the person is wearing. The sensor map is then drawn for that headset: five
+   nodes for an Insight, fourteen for an EPOC X, two for an MN8.
+6. Work the sensors until every node is green, then press **Continue ›**.
+
+Contact and EEG quality keep being monitored while the board is in use, on the
+strip above the keyboard, and a sensor that drops out is named there — during a
+conversation, "push T7 back down" is useful and "contact 60%" is not.
+
+**Language.** The **EN / 中文** switch is in the top-right of both the headset
+list and the preflight screen, and can be changed at any time. It translates the
+interface and the phrase board; the letter grid stays A–Z. Phrases a caregiver
+adds themselves are shown exactly as typed. Speaking Chinese out loud needs a
+Chinese voice installed in Windows or macOS — without one the system voice will
+read the characters as silence.
 
 **About the profile.** Mental commands need a profile that has been trained,
 in EMOTIV's own software, on the *same headset model* you are using — a profile
@@ -110,11 +126,29 @@ This repository contains three evolutionary versions of the communication board:
 | :--- | :--- | :--- |
 | `scanningboard.py` | **Original Core Board:** The foundational 2-stage matrix scanner interface without the preflight diagnostic wizard or credential dialogs. | Legacy |
 | `scanningboard_setupscreen.py` | **Diagnostics & Visual Update:** Introduces the preflight Contact Quality (CQ) and EEG Quality (EQ) sensor maps with EMOTIV brand styling (`#d9145a` hot-pink). | Intermediate |
-| `scanningboard_setupandconfig.py` | **Production Master:** The complete, feature-rich version including in-app API credential setup, caregiver phrase management, live battery/signal diagnostics, TTS synthesis, dynamic sensitivity sliders, and clean exit thread handling. | **Recommended (Latest)** |
+| `scanningboard_setupandconfig.py` | **Production Master:** The complete version — headset picker, per-headset sensor maps, live contact/EEG monitoring, English and Chinese, in-app API credential setup, caregiver phrase management, TTS synthesis, dynamic sensitivity sliders, and clean exit thread handling. This is the one the installers build. | **Recommended (Latest)** |
+
+The two earlier versions are kept for reference and have not been updated with
+the headset picker, the per-headset sensor map or the translation.
 
 ---
 
 ## Key Features (`scanningboard_setupandconfig.py`)
+
+### Any EMOTIV Headset
+* **Headset picker:** the first screen lists every headset Cortex reports, with its status, how it is connected, and what it can do. Nothing connects automatically — in a room with two headsets, guessing is worse than asking.
+* **Sensor map built from the hardware:** the electrode names come from Cortex's own subscription result, so Insight, EPOC X, MN8 and anything released later all draw every sensor they actually have.
+* **Capability differences are stated, not hidden:** MN8 has no `fac` stream, so on MN8 the facial controls are disabled and labelled rather than left on screen never firing.
+
+### Live Quality Monitoring
+* **Contact and EEG quality on the board itself**, not only before the session.
+* **Named sensors:** when a sensor drops below usable, the strip says which one.
+* **Battery** alongside both, so a session does not end mid-sentence unannounced.
+
+### English and 中文
+* Interface, instructions, status messages and the phrase board are translated; the letter grid stays A–Z.
+* Switchable at any time from the header; the choice is remembered in `config.json`.
+* What gets spoken is the label in the current language, so a Chinese board composes and speaks a Chinese sentence.
 
 ### Dual-Stream Telemetry Engine
 * **Mental Commands (`com`):** Maps `Push` (Select) and `Pull` (Change Speed) intent streams directly to matrix targeting.
@@ -133,6 +167,7 @@ This repository contains three evolutionary versions of the communication board:
 ### ⚙️ In-App API & Profile Configuration
 * Open the **`⚙️ API Settings`** modal to input your EMOTIV Developer **Client ID**, **Client Secret**, and trained **Profile Name**.
 * Saves credentials to `config.json` and prompts automatically on initial startup if configuration files are missing.
+* `config.json` and `phrases.json` are **runtime files and are not tracked in git** — `config.example.json` shows the shape. Earlier versions of this repository committed a real Client ID and Secret, and the application ignored whatever you entered in favour of them; both problems are fixed, and that key should be treated as compromised and revoked.
 
 ### 🔊 Speech & Editing Controls
 * **Offline Text-to-Speech (TTS):** Integrated `pyttsx3` voice engine with an asynchronous worker thread so audio playback never freezes matrix scanning.
@@ -177,6 +212,18 @@ The EMOTIV Launcher must be running first — it is what serves Cortex on
 `wss://localhost:6868`. On the first launch the app asks for your EMOTIV
 Developer Client ID, Client Secret and trained profile name; those are saved
 for next time.
+
+### 4. Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+They need no headset. They cover the headset table (that MN8 reports two
+channels and no facial stream, that EPOC X reports fourteen, that an unknown
+model is still usable), the sensor layout, and that the two languages have the
+same keys and the same parameters — a missing parameter would print a literal
+`{power}` on screen in front of someone who cannot type a correction.
 
 ### Where your settings are kept
 

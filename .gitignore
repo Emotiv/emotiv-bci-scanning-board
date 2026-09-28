@@ -21,3 +21,8 @@ packaging/app_icon.iconset/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Runtime settings written by the app. config.json holds Cortex credentials,
+# which is why it must never be committed again.
+config.json
+phrases.json

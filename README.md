@@ -87,12 +87,20 @@ or the app cannot reach Cortex.
 
 1. Start **EMOTIV Launcher** and sign in. Connect your headset and check it is
    reporting good contact quality.
-2. Open the scanning board. Because there are no saved credentials yet, it opens
-   the **⚙️ API Settings** dialog straight away.
+2. Open the scanning board. The first time, it has no application keys, so it
+   asks for them straight away — the **⚙️ API Settings** dialog opens over the
+   headset screen and the screen behind it explains why.
 3. Paste your **Client ID** and **Client Secret**, and type the name of the
    trained **profile** you want to use.
 4. Choose which inputs you want under **Include Mental Commands** and **Include
    Facial Expressions**, and which action each one triggers.
+
+   **EMOTIV Launcher will ask you to approve this application.** The first time
+   an application uses your headset, the Launcher shows an approval prompt.
+   Until you accept it, the board shows *"Approve this app in EMOTIV Launcher"*
+   and keeps asking Cortex every few seconds, so once you approve it in the
+   Launcher this screen carries on by itself — there is nothing to restart.
+   **Check now** forces an immediate re-check if you would rather not wait.
 5. Press OK. The board lists every headset the Launcher can see — pick the one
    the person is wearing. The sensor map is then drawn for that headset: five
    nodes for an Insight, fourteen for an EPOC X, two for an MN8.
@@ -167,6 +175,7 @@ the headset picker, the per-headset sensor map or the translation.
 ### ⚙️ In-App API & Profile Configuration
 * Open the **`⚙️ API Settings`** modal to input your EMOTIV Developer **Client ID**, **Client Secret**, and trained **Profile Name**.
 * Saves credentials to `config.json` and prompts automatically on initial startup if configuration files are missing.
+* Keys are asked for the first time the app is opened, saved to `config.json` on this computer, and never sent anywhere except the local Cortex service.
 * `config.json` and `phrases.json` are **runtime files and are not tracked in git** — `config.example.json` shows the shape. Earlier versions of this repository committed a real Client ID and Secret, and the application ignored whatever you entered in favour of them; both problems are fixed, and that key should be treated as compromised and revoked.
 
 ### 🔊 Speech & Editing Controls
@@ -219,7 +228,9 @@ for next time.
 python -m unittest discover -s tests
 ```
 
-They need no headset. They cover the headset table (that MN8 reports two
+They need no headset. They check that no credential is committed anywhere in
+the repository and that `cortex.py` uses the keys it is given, and they cover
+the headset table (that MN8 reports two
 channels and no facial stream, that EPOC X reports fourteen, that an unknown
 model is still usable), the sensor layout, and that the two languages have the
 same keys and the same parameters — a missing parameter would print a literal

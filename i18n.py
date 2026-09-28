@@ -31,6 +31,31 @@ STRINGS = {
         "nav.back": "‹ Back",
 
         # ── headset list ──────────────────────────────────────────────────
+        # ── approval in EMOTIV Launcher ───────────────────────────────────
+        "access.credentials_title": "Your EMOTIV application keys are needed",
+        "access.credentials_body": "The board talks to Cortex as an application, and "
+                                   "every person uses their own free key. Create one at "
+                                   "emotiv.com → My Account → Cortex Apps, then paste "
+                                   "the Client ID and Client Secret here. They are "
+                                   "stored on this computer only.",
+        "access.enter_credentials": "Enter keys",
+        "access.pending_title": "Approve this app in EMOTIV Launcher",
+        "access.pending_body": "EMOTIV Launcher is asking whether this application may "
+                               "use your headset. Switch to the Launcher, approve it, "
+                               "and this screen carries on by itself. It is checking "
+                               "every few seconds.",
+        "access.check_again": "Check now",
+        "access.rejected_title": "Access was declined",
+        "access.rejected_body": "EMOTIV Launcher declined this application. Approve it "
+                                "there, or ask again below.",
+        "access.ask_again": "Ask again",
+        "access.failed_title": "Cortex refused these keys",
+        "access.failed_body": "Cortex did not accept this Client ID and Client Secret: "
+                              "{detail}",
+        "status.awaiting_approval": "Waiting for approval in EMOTIV Launcher…",
+        "status.access_granted": "Approved. Connecting…",
+        "status.access_rejected": "EMOTIV Launcher declined this application.",
+
         "device.title": "Choose a headset",
         "device.subtitle": "Every headset the EMOTIV Launcher can see. Pick the one "
                            "on the person's head.",
@@ -258,6 +283,27 @@ STRINGS = {
         "nav.contact_quality": "接触质量",
         "nav.eeg_quality": "脑电质量",
         "nav.back": "‹ 返回",
+
+        "access.credentials_title": "需要你的 EMOTIV 应用密钥",
+        "access.credentials_body": "沟通板以“应用”的身份连接 Cortex，每个人都使用自己的免费密钥。"
+                                   "请在 emotiv.com → My Account → Cortex Apps 创建一个应用，"
+                                   "然后把 Client ID 和 Client Secret 填到这里。"
+                                   "它们只保存在这台电脑上。",
+        "access.enter_credentials": "填写密钥",
+        "access.pending_title": "请在 EMOTIV Launcher 中批准本应用",
+        "access.pending_body": "EMOTIV Launcher 正在询问是否允许本应用使用你的头戴设备。"
+                               "请切换到 Launcher 并点击批准，本页面会自动继续，"
+                               "它每隔几秒就会检查一次。",
+        "access.check_again": "立即检查",
+        "access.rejected_title": "访问被拒绝",
+        "access.rejected_body": "EMOTIV Launcher 拒绝了本应用。请在 Launcher 中批准，"
+                                "或在下方重新申请。",
+        "access.ask_again": "重新申请",
+        "access.failed_title": "Cortex 不接受这组密钥",
+        "access.failed_body": "Cortex 拒绝了该 Client ID 与 Client Secret：{detail}",
+        "status.awaiting_approval": "正在等待 EMOTIV Launcher 中的批准…",
+        "status.access_granted": "已批准，正在连接…",
+        "status.access_rejected": "EMOTIV Launcher 拒绝了本应用。",
 
         "device.title": "选择头戴设备",
         "device.subtitle": "以下是 EMOTIV Launcher 能看到的全部设备，请选择使用者正在佩戴的那一台。",

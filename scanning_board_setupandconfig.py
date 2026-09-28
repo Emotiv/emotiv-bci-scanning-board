@@ -488,6 +488,8 @@ class EmotivCortexWorker(QThread):
     facial_expression_signal = pyqtSignal(str, float, str, float)
     status_signal = pyqtSignal(str, dict)
     stream_failed_signal = pyqtSignal(str, str)
+    # "credentials" | "pending" | "granted" | "rejected" | "failed", plus detail
+    access_state_signal = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -518,14 +520,29 @@ class EmotivCortexWorker(QThread):
                 except Exception as e:
                     self.status_signal.emit("status.failed", {"detail": str(e)})
 
+    def retry_access(self):
+        """Ask Cortex again whether the user has approved us in the Launcher."""
+        with self._lock:
+            if self.cortex:
+                try:
+                    self.cortex.retry_access()
+                except Exception as e:
+                    self.status_signal.emit("status.failed", {"detail": str(e)})
+
     # ── the thread itself ────────────────────────────────────────────────
     def run(self):
         self.status_signal.emit("status.connecting", {})
 
         cfg = load_config()
-        client_id = cfg.get("cortex_client_id", cfg.get("client_id", ""))
-        client_secret = cfg.get("cortex_client_secret", cfg.get("client_secret", ""))
+        client_id = cfg.get("cortex_client_id", cfg.get("client_id", "")).strip()
+        client_secret = cfg.get("cortex_client_secret", cfg.get("client_secret", "")).strip()
         profile_name = cfg.get("profile_name", "")
+
+        # Without keys there is nothing to authorize with, and Cortex would
+        # answer with an error the user cannot act on. Ask first instead.
+        if not client_id or not client_secret:
+            self.access_state_signal.emit("credentials", "")
+            return
 
         try:
             from cortex import Cortex
@@ -548,6 +565,9 @@ class EmotivCortexWorker(QThread):
             cortex.bind(new_fe_data=self._on_fac)
             cortex.bind(sub_failure=self._on_sub_failure)
             cortex.bind(inform_error=self._on_error)
+            cortex.bind(access_pending=self._on_access_pending)
+            cortex.bind(access_granted=self._on_access_granted)
+            cortex.bind(access_rejected=self._on_access_rejected)
 
             self.status_signal.emit("status.linked", {})
             cortex.open()
@@ -649,9 +669,28 @@ class EmotivCortexWorker(QThread):
         message = kwargs.get("message", "")
         self.stream_failed_signal.emit(str(stream), str(message))
 
+    def _on_access_pending(self, *args, **kwargs):
+        self.access_state_signal.emit("pending", str(kwargs.get("data", "")))
+        self.status_signal.emit("status.awaiting_approval", {})
+
+    def _on_access_granted(self, *args, **kwargs):
+        self.access_state_signal.emit("granted", "")
+        self.status_signal.emit("status.access_granted", {})
+
+    def _on_access_rejected(self, *args, **kwargs):
+        self.access_state_signal.emit("rejected", str(kwargs.get("data", "")))
+        self.status_signal.emit("status.access_rejected", {})
+
     def _on_error(self, *args, **kwargs):
         error = kwargs.get("error_data", {})
         detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        request_id = kwargs.get("request_id")
+
+        # 3 is requestAccess and 4 is authorize; either failing means the keys
+        # themselves are the problem, which is a different thing to fix than a
+        # headset or a stream going wrong.
+        if request_id in (3, 4):
+            self.access_state_signal.emit("failed", detail)
         self.status_signal.emit("status.failed", {"detail": detail})
 
 
@@ -867,15 +906,30 @@ class BCICommunicationBoard(QMainWindow):
         self.cortex_thread.mental_command_signal.connect(self.route_bci_command)
         self.cortex_thread.facial_expression_signal.connect(self.route_facial_command)
         self.cortex_thread.stream_failed_signal.connect(self.on_stream_failed)
+        self.cortex_thread.access_state_signal.connect(self.on_access_state)
         self.cortex_thread.start()
 
     def check_credentials_on_launch(self):
-        if not os.path.exists(CONFIG_PATH):
+        """Ask for the application keys the first time this screen is opened.
+
+        A saved file is not the test — an empty Client ID in an existing file
+        cannot authorize either, and the user should be asked rather than shown
+        a Cortex error about it.
+        """
+        cfg = load_config()
+        has_keys = (cfg.get("cortex_client_id", cfg.get("client_id", "")).strip()
+                    and cfg.get("cortex_client_secret", cfg.get("client_secret", "")).strip())
+        if not has_keys:
+            self.on_access_state("credentials", "")
             self.open_credentials_dialog()
 
     def open_credentials_dialog(self):
         dlg = CortexCredentialsDialog(self, facial_supported=self.device_facial_supported)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            # New keys mean the whole connection sequence starts again, from
+            # asking Cortex whether this application is allowed to run.
+            self.access_banner.setVisible(False)
+            self.access_retry_timer.stop()
             self.load_bci_action_mappings()
             self.mental_selector.setChecked(self.init_include_mental)
             self.facial_selector.setChecked(
@@ -931,6 +985,8 @@ class BCICommunicationBoard(QMainWindow):
     def retranslate(self):
         """Redraw everything that is not a plain bound label."""
         self.render_headset_list()
+        if self.access_state and self.access_banner.isVisible():
+            self.on_access_state(self.access_state, self.access_detail)
         self.switch_setup_tab(self.current_setup_tab)
         self.build_board_grid()
         self.update_ui_highlights()
@@ -984,6 +1040,50 @@ class BCICommunicationBoard(QMainWindow):
         subtitle.setStyleSheet("color: #64748b; margin-bottom: 12px;")
         layout.addWidget(subtitle)
 
+        # Everything that stands between the user and a connection appears
+        # here: missing keys, an approval waiting in EMOTIV Launcher, a refusal.
+        self.access_banner = QWidget()
+        self.access_banner.setStyleSheet(
+            "QWidget { background-color: #fff1f2; border: 1px solid #f9a8c4;"
+            "border-radius: 8px; }")
+        banner_row = QHBoxLayout(self.access_banner)
+        banner_row.setContentsMargins(16, 12, 16, 12)
+
+        banner_text = QVBoxLayout()
+        banner_text.setSpacing(2)
+        self.access_title_lbl = QLabel()
+        self.access_title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        self.access_title_lbl.setStyleSheet("color: #9f1239; border: none;")
+        banner_text.addWidget(self.access_title_lbl)
+
+        self.access_body_lbl = QLabel()
+        self.access_body_lbl.setFont(QFont("Segoe UI", 10))
+        self.access_body_lbl.setWordWrap(True)
+        self.access_body_lbl.setStyleSheet("color: #4f5d75; border: none;")
+        banner_text.addWidget(self.access_body_lbl)
+        banner_row.addLayout(banner_text, stretch=1)
+
+        self.access_action_btn = QPushButton()
+        self.access_action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.access_action_btn.setFixedSize(150, 42)
+        self.access_action_btn.setStyleSheet(
+            "QPushButton { background-color: #d9145a; color: white; border-radius: 4px;"
+            "font-weight: bold; } QPushButton:hover { background-color: #b00f46; }")
+        self.access_action_btn.clicked.connect(self.on_access_action)
+        banner_row.addWidget(self.access_action_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        self.access_banner.setVisible(False)
+        self.access_detail = ""
+        layout.addWidget(self.access_banner)
+
+        # While approval is outstanding, ask Cortex again on a timer as well as
+        # on the button: the user approves in another window and should not have
+        # to come back here and press anything.
+        self.access_retry_timer = QTimer(self)
+        self.access_retry_timer.setInterval(3000)
+        self.access_retry_timer.timeout.connect(self.retry_access)
+        self.access_state = ""
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1015,6 +1115,52 @@ class BCICommunicationBoard(QMainWindow):
 
         self.render_headset_list()
 
+    def on_access_state(self, state, detail):
+        """What the user has to do before a headset can be reached."""
+        self.access_state = state
+        self.access_detail = detail
+
+        if state == "granted":
+            self.access_banner.setVisible(False)
+            self.access_retry_timer.stop()
+            return
+
+        if state == "credentials":
+            self.access_title_lbl.setText(t("access.credentials_title"))
+            self.access_body_lbl.setText(t("access.credentials_body"))
+            self.access_action_btn.setText(t("access.enter_credentials"))
+            self.access_retry_timer.stop()
+        elif state == "pending":
+            self.access_title_lbl.setText(t("access.pending_title"))
+            self.access_body_lbl.setText(t("access.pending_body"))
+            self.access_action_btn.setText(t("access.check_again"))
+            self.access_retry_timer.start()
+        elif state == "rejected":
+            self.access_title_lbl.setText(t("access.rejected_title"))
+            self.access_body_lbl.setText(t("access.rejected_body"))
+            self.access_action_btn.setText(t("access.ask_again"))
+            # Keep asking: the usual reason for a refusal is the wrong button in
+            # the Launcher, and the user's next move is to approve it properly.
+            self.access_retry_timer.start()
+        elif state == "failed":
+            self.access_title_lbl.setText(t("access.failed_title"))
+            self.access_body_lbl.setText(t("access.failed_body", detail=detail))
+            self.access_action_btn.setText(t("access.enter_credentials"))
+            self.access_retry_timer.stop()
+
+        self.access_banner.setVisible(True)
+        self.page_container.setCurrentIndex(PAGE_DEVICES)
+
+    def on_access_action(self):
+        if self.access_state in ("credentials", "failed"):
+            self.open_credentials_dialog()
+        else:
+            self.retry_access()
+
+    def retry_access(self):
+        if self.cortex_thread:
+            self.cortex_thread.retry_access()
+
     def refresh_headsets(self):
         i18n.bind(self.device_status_lbl, "device.searching")
         if self.cortex_thread:
@@ -1027,8 +1173,13 @@ class BCICommunicationBoard(QMainWindow):
     def render_headset_list(self):
         while self.device_list_layout.count():
             item = self.device_list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget:
+                # deleteLater() alone leaves the widget parented and painting
+                # until the event loop gets round to it, which shows the
+                # previous list underneath the new one.
+                widget.setParent(None)
+                widget.deleteLater()
 
         if not self.headsets:
             empty = QWidget()
@@ -1644,8 +1795,10 @@ class BCICommunicationBoard(QMainWindow):
     def build_board_grid(self):
         while self.grid_layout.count():
             child = self.grid_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            widget = child.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
 
         self.grid_widgets = []
         for r in range(len(self.current_matrix)):

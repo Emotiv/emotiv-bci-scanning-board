@@ -97,7 +97,11 @@ class Cortex(Dispatcher):
                 # Added for the scanning board: the app picks the headset itself
                 # rather than taking whichever one answered first, reads EEG
                 # quality, and needs to know when a stream was refused.
-                'headset_list_done', 'new_eq_data', 'sub_failure']
+                'headset_list_done', 'new_eq_data', 'sub_failure',
+                # Approving the application in EMOTIV Launcher is a step the
+                # user has to take, so it has to reach the user interface
+                # instead of being a warning printed to a console nobody reads.
+                'access_pending', 'access_granted', 'access_rejected']
     def __init__(self, client_id, client_secret, debug_mode=False, **kwargs):
         # These two used to be overwritten here with a hard-coded application
         # key, which meant the credentials a user entered were silently ignored
@@ -178,6 +182,7 @@ class Cortex(Dispatcher):
         if req_id == HAS_ACCESS_RIGHT_ID:
             access_granted = result_dic['accessGranted']
             if access_granted == True:
+                self.emit('access_granted', data='')
                 # authorize
                 self.authorize()
             else:
@@ -187,12 +192,16 @@ class Cortex(Dispatcher):
             access_granted = result_dic['accessGranted']
 
             if access_granted == True:
+                self.emit('access_granted', data='')
                 # authorize
                 self.authorize()
             else:
-                # wait approve from Emotiv Launcher
+                # Waiting on approval in EMOTIV Launcher. This used to warn and
+                # stop, leaving the app with nothing to show and nothing to do;
+                # the caller is told instead, and can ask again.
                 msg = result_dic['message']
                 warnings.warn(msg)
+                self.emit('access_pending', data=msg)
         elif req_id == AUTHORIZE_ID:
             print("Authorize successfully.")
             self.auth = result_dic['cortexToken']
@@ -350,7 +359,9 @@ class Cortex(Dispatcher):
     def handle_error(self, recv_dic):
         req_id = recv_dic['id']
         print('handle_error: request Id ' + str(req_id))
-        self.emit('inform_error', error_data=recv_dic['error'])
+        # Which request failed decides what the user can do about it: a rejected
+        # authorize means the credentials are wrong, and nothing else does.
+        self.emit('inform_error', error_data=recv_dic['error'], request_id=req_id)
     
     def handle_warning(self, warning_dic):
 
@@ -359,8 +370,11 @@ class Cortex(Dispatcher):
         warning_code = warning_dic['code']
         warning_msg = warning_dic['message']
         if warning_code == ACCESS_RIGHT_GRANTED:
+            self.emit('access_granted', data='')
             # call authorize again
             self.authorize()
+        elif warning_code == ACCESS_RIGHT_REJECTED:
+            self.emit('access_rejected', data=str(warning_msg))
         elif warning_code == HEADSET_CONNECTED:
             # query headset again then create session
             self.query_headset()
@@ -592,6 +606,14 @@ class Cortex(Dispatcher):
     def do_prepare_steps(self):
         print('do_prepare_steps--------------------------------')
         # check access right
+        self.has_access_right()
+
+    def retry_access(self):
+        """Ask Cortex again whether this application has been approved.
+
+        Safe to call repeatedly: it is the same first step of the connection
+        sequence, and a granted result carries straight on to authorize.
+        """
         self.has_access_right()
 
     def disconnect_headset(self):

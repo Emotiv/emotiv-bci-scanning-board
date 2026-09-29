@@ -498,6 +498,7 @@ class EmotivCortexWorker(QThread):
         self._labels = {}
         self._wanted_headset = ""
         self._want_facial = True
+        self._profile_name = ""
 
     # ── called from the UI thread ────────────────────────────────────────
     def connect_to(self, headset_id: str, want_facial: bool = True):
@@ -555,9 +556,15 @@ class EmotivCortexWorker(QThread):
             with self._lock:
                 self.cortex = cortex
 
+            # Every listener has to be a bound method, never a lambda or a
+            # local function: python-dispatch keeps listeners WEAKLY, so a
+            # lambda passed straight into bind() is collected before the event
+            # can ever reach it. That is what made the app authorize, connect,
+            # and then sit there forever with no data: the session was created
+            # and nothing subscribed.
+            self._profile_name = profile_name
             cortex.bind(headset_list_done=self._on_headset_list)
-            cortex.bind(create_session_done=lambda *a, **k:
-                        self._on_session(profile_name))
+            cortex.bind(create_session_done=self._on_session)
             cortex.bind(new_data_labels=self._on_labels)
             cortex.bind(new_dev_data=self._on_dev)
             cortex.bind(new_eq_data=self._on_eq)
@@ -590,7 +597,8 @@ class EmotivCortexWorker(QThread):
             })
         self.headsets_signal.emit(headsets)
 
-    def _on_session(self, profile_name):
+    def _on_session(self, *args, **kwargs):
+        profile_name = self._profile_name
         headset_id = ""
         with self._lock:
             if self.cortex:
@@ -1889,20 +1897,28 @@ class BCICommunicationBoard(QMainWindow):
         self.completion_percentage_label.setText(f"{shown}%")
 
         missing = len(devices.weak_sensors(self.head_map.cq_status))
+
+        # Continue is never blocked. A perfect fit is what you want, but a
+        # caregiver may need the board with a sensor that will not sit, or
+        # before any reading has arrived at all, and refusing to open it does
+        # not improve the signal — it just leaves the person without a voice.
+        self.continue_btn.setEnabled(True)
+
         if total and cq_pct == 100 and eq_pct == 100:
             self.completion_percentage_label.setStyleSheet("color: #2ecc71;")
             self.completion_hint_label.setText(t("setup.ready"))
-            self.continue_btn.setEnabled(True)
+            self.completion_hint_label.setStyleSheet("color: #27ae60;")
+        elif not total:
+            self.completion_percentage_label.setStyleSheet("color: #cbd5e1;")
+            self.completion_hint_label.setText(t("setup.no_data"))
+            self.completion_hint_label.setStyleSheet("color: #64748b;")
         else:
             self.completion_percentage_label.setStyleSheet("color: #cbd5e1;")
-            if not total:
-                self.completion_hint_label.setText("")
-            elif missing == 1:
-                self.completion_hint_label.setText(t("setup.waiting_one"))
-            else:
-                self.completion_hint_label.setText(
-                    t("setup.waiting_many", count=missing))
-            self.continue_btn.setEnabled(False)
+            waiting = (t("setup.waiting_one") if missing == 1
+                       else t("setup.waiting_many", count=missing))
+            self.completion_hint_label.setText(
+                waiting + " " + t("setup.continue_anyway"))
+            self.completion_hint_label.setStyleSheet("color: #64748b;")
 
     def update_hardware_banner(self, device_id):
         i18n.unbind(self.device_name_label)

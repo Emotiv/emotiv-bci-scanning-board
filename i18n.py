@@ -113,6 +113,10 @@ STRINGS = {
         "setup.ready": "Every sensor is good. You can start.",
         "setup.waiting_one": "One more sensor to adjust.",
         "setup.waiting_many": "{count} more sensors to adjust.",
+        "setup.continue_anyway": "You can continue anyway — a sensor that is not green "
+                                 "simply contributes nothing.",
+        "setup.no_data": "No readings yet. Check the headset is switched on and the "
+                         "EMOTIV Launcher is signed in. You can still continue.",
         "setup.two_channel_note": "This headset has only these two sensors, so there "
                                   "is no head map to fill in. Both have to be green "
                                   "before the board will accept a selection.",
@@ -349,6 +353,9 @@ STRINGS = {
         "setup.ready": "所有电极状态良好，可以开始了。",
         "setup.waiting_one": "还有 1 个电极未就绪。",
         "setup.waiting_many": "还有 {count} 个电极未就绪。",
+        "setup.continue_anyway": "也可以直接继续 —— 未变绿的电极只是不参与读取。",
+        "setup.no_data": "尚未收到数据。请确认头戴设备已开机，并且 EMOTIV Launcher 已登录。"
+                         "你也可以直接继续。",
         "setup.two_channel_note": "该设备只有这两个电极，因此没有需要逐个填满的头部图。"
                                   "两个电极都必须变绿，沟通板才会接受选择。",
 

@@ -97,7 +97,7 @@ if sys.platform == "darwin":
         bundle_identifier="com.emotiv.scanningboard",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "1.1.1",
+            "CFBundleShortVersionString": "1.2.0",
             "LSMinimumSystemVersion": "11.0",
             # Cortex runs on localhost; recent macOS versions treat that as the
             # local network and block it silently without this key.

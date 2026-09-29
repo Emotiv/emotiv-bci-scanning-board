@@ -71,6 +71,16 @@ NON_SENSOR_LABELS = {"OVERALL", "CMS", "DRL", "BATTERY", "SIGNAL"}
 ACTION_TOKENS = {"FLIP OVER", "SPEAK", "BACKSPACE", "PAUSE SCANNER",
                  "CLEAR MESSAGE", "SPACE"}
 
+# How long each row or column is held before the scanner moves on, slowest
+# first. Three seconds exists because reaction time is not the same thing as
+# ability: someone who needs four seconds to produce a clench is not slower at
+# deciding, they are slower at signalling, and a board that moves on before
+# they can answer is unusable rather than merely brisk.
+SCAN_INTERVALS = [3000, 2000, 1500, 1000, 600]
+SPEED_KEYS = ["speed.very_slow", "speed.slow", "speed.medium",
+              "speed.fast", "speed.very_fast"]
+DEFAULT_SPEED_INDEX = 2   # medium
+
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
@@ -700,6 +710,21 @@ class EmotivCortexWorker(QThread):
         if request_id in (3, 4):
             self.access_state_signal.emit("failed", detail)
         self.status_signal.emit("status.failed", {"detail": detail})
+
+
+class ClickableLabel(QLabel):
+    """A board cell a carer can also reach with a mouse.
+
+    The person using the board selects with their headset; the person helping
+    them should not have to wait for the scanner to come round.
+    """
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class HeadsetMapWidget(QWidget):
@@ -1488,9 +1513,12 @@ class BCICommunicationBoard(QMainWindow):
         self.active_row = 0
         self.active_col = 0
 
-        self.scan_intervals = [2000, 1500, 1000, 600]
-        self.speed_keys = ["speed.slow", "speed.medium", "speed.fast", "speed.very_fast"]
-        self.speed_index = 1
+        self.scan_intervals = list(SCAN_INTERVALS)
+        self.speed_keys = list(SPEED_KEYS)
+        self.speed_index = load_config().get("speed_index", DEFAULT_SPEED_INDEX)
+        if not isinstance(self.speed_index, int) or not (
+                0 <= self.speed_index < len(self.scan_intervals)):
+            self.speed_index = DEFAULT_SPEED_INDEX
         self.composed_text = ""
 
         # --- THRESHOLDS, COOLDOWN, & PAUSE STATES ---
@@ -1661,14 +1689,18 @@ class BCICommunicationBoard(QMainWindow):
         speed_title.setFont(QFont("Segoe UI", 11))
         status_layout.addWidget(speed_title)
 
+        # Buttons, not labels: a carer watching someone struggle should be able
+        # to reach for the speed they want directly, rather than cycling the
+        # scanner through three wrong ones to get to it.
         self.speed_widgets = []
-        for key in self.speed_keys:
-            lbl = i18n.bind(QLabel(), key)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-            lbl.setFixedSize(85, 22)
-            status_layout.addWidget(lbl)
-            self.speed_widgets.append(lbl)
+        for index, key in enumerate(self.speed_keys):
+            btn = i18n.bind(QPushButton(), key)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            btn.setFixedSize(88, 24)
+            btn.clicked.connect(lambda _c=False, i=index: self.set_speed(i))
+            status_layout.addWidget(btn)
+            self.speed_widgets.append(btn)
 
         status_layout.addStretch()
 
@@ -1808,6 +1840,17 @@ class BCICommunicationBoard(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
 
+        # The CANCEL cell lives outside the matrix: it is not something anyone
+        # wants to say, it is the way back out of a row chosen by mistake. It
+        # joins the grid only while a row is locked.
+        self.cancel_cell = ClickableLabel()
+        self.cancel_cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cancel_cell.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        self.cancel_cell.setWordWrap(True)
+        self.cancel_cell.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_cell.clicked.connect(self.cancel_row_selection)
+        self.cancel_cell.setVisible(False)
+
         self.grid_widgets = []
         for r in range(len(self.current_matrix)):
             row_widgets = []
@@ -1823,6 +1866,17 @@ class BCICommunicationBoard(QMainWindow):
                 self.grid_layout.addWidget(label, r, c)
                 row_widgets.append(label)
             self.grid_widgets.append(row_widgets)
+
+    def show_cancel_cell(self, visible):
+        """Put CANCEL at the end of the locked row, or take it away."""
+        cell = getattr(self, "cancel_cell", None)
+        if cell is None:
+            return
+        self.grid_layout.removeWidget(cell)
+        if visible:
+            cell.setText(i18n.cell("CANCEL"))
+            self.grid_layout.addWidget(cell, self.active_row, self.cancel_index())
+        cell.setVisible(bool(visible))
 
     def switch_setup_tab(self, mode):
         self.current_setup_tab = mode
@@ -2105,7 +2159,9 @@ class BCICommunicationBoard(QMainWindow):
         if self.scanning_state == self.SCAN_ROWS:
             self.active_row = (self.active_row + 1) % len(self.current_matrix)
         elif self.scanning_state == self.SCAN_COLS:
-            self.active_col = (self.active_col + 1) % len(self.current_matrix[self.active_row])
+            # One past the last cell is CANCEL, so every sweep of a row ends by
+            # offering a way out of it.
+            self.active_col = (self.active_col + 1) % (self.cancel_index() + 1)
         self.update_ui_highlights()
 
     def update_ui_highlights(self):
@@ -2143,6 +2199,23 @@ class BCICommunicationBoard(QMainWindow):
                     else:
                         widget.setStyleSheet("border: 1px solid #f1f5f9; background-color: #ffffff; color: #cbd5e1; border-radius: 6px; padding: 5px;")
 
+        self.paint_cancel_cell()
+
+    def paint_cancel_cell(self):
+        cell = getattr(self, "cancel_cell", None)
+        # isHidden rather than isVisible: the cell's own state is what matters
+        # here, not whether the window happens to be on screen.
+        if cell is None or cell.isHidden():
+            return
+        if self.active_col == self.cancel_index():
+            cell.setStyleSheet(
+                "border: 2px solid #7f1d1d; background-color: #b91c1c; color: #ffffff;"
+                "font-weight: bold; border-radius: 6px; padding: 5px;")
+        else:
+            cell.setStyleSheet(
+                "border: 1px dashed #b91c1c; background-color: #fef2f2; color: #b91c1c;"
+                "font-weight: bold; border-radius: 6px; padding: 5px;")
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
             if self.page_container.currentIndex() == PAGE_PREFLIGHT:
@@ -2160,21 +2233,57 @@ class BCICommunicationBoard(QMainWindow):
         elif event.key() == Qt.Key.Key_P and self.page_container.currentIndex() == PAGE_BOARD:
             self.process_selection("PAUSE SCANNER")
 
+    def row_length(self) -> int:
+        """Cells in the row being scanned, not counting CANCEL."""
+        if not self.current_matrix:
+            return 0
+        row = self.current_matrix[self.active_row % len(self.current_matrix)]
+        return len(row)
+
+    def cancel_index(self) -> int:
+        """CANCEL sits one past the last cell, so the sweep reaches it last."""
+        return self.row_length()
+
     def trigger_select_event(self):
         if self.scanning_state == self.SCAN_ROWS:
             self.scanning_state = self.SCAN_COLS
             self.active_col = 0
+            self.show_cancel_cell(True)
             self.update_ui_highlights()
             self.start_cooldown_phase("phase.row_locked")
 
         elif self.scanning_state == self.SCAN_COLS:
+            if self.active_col == self.cancel_index():
+                self.cancel_row_selection()
+                return
+
             selected_token = self.current_matrix[self.active_row][self.active_col]
             self.process_selection(selected_token)
 
             self.scanning_state = self.SCAN_ROWS
             self.active_row = 0
+            self.show_cancel_cell(False)
             self.update_ui_highlights()
             self.start_cooldown_phase("phase.selection_complete")
+
+    def cancel_row_selection(self):
+        """Back out of a row that was selected by mistake.
+
+        Without this, choosing the wrong row means sitting through every cell in
+        it before the scanner returns — and the usual way out was to select
+        something wrong on purpose and then delete it. The sweep resumes from
+        the same row rather than jumping to the top, because the row that was
+        actually wanted is usually next to the one that was hit.
+
+        The cooldown afterwards is the same as any selection: whatever the
+        person did to trigger this is probably still being held, and without the
+        pause it would immediately re-select the row they just escaped.
+        """
+        self.scanning_state = self.SCAN_ROWS
+        self.active_col = 0
+        self.show_cancel_cell(False)
+        self.update_ui_highlights()
+        self.start_cooldown_phase("phase.cancelled")
 
     def start_cooldown_phase(self, phase_key):
         self.in_cooldown = True
@@ -2219,16 +2328,33 @@ class BCICommunicationBoard(QMainWindow):
         self.update_ui_highlights()
 
     def trigger_speed_change(self):
-        self.speed_index = (self.speed_index + 1) % len(self.scan_intervals)
-        self.timer.setInterval(self.scan_intervals[self.speed_index])
+        """Next speed along — what the mapped command and the S key do."""
+        self.set_speed((self.speed_index + 1) % len(self.scan_intervals))
+
+    def set_speed(self, index):
+        """Go straight to one speed.
+
+        Remembered between sessions, because the right speed is a property of
+        the person using the board, not of this run of the application.
+        """
+        if not 0 <= index < len(self.scan_intervals):
+            return
+        self.speed_index = index
+        self.timer.setInterval(self.scan_intervals[index])
+        save_config({"speed_index": index})
         self.update_status_bar()
 
     def update_status_bar(self):
-        for i, lbl in enumerate(self.speed_widgets):
+        for i, btn in enumerate(self.speed_widgets):
             if i == self.speed_index:
-                lbl.setStyleSheet("background-color: #d9145a; color: #ffffff; border-radius: 4px; font-weight: bold;")
+                btn.setStyleSheet(
+                    "QPushButton { background-color: #d9145a; color: #ffffff;"
+                    "border: none; border-radius: 4px; font-weight: bold; }")
             else:
-                lbl.setStyleSheet("background-color: #e2e8f0; color: #475569; border-radius: 4px;")
+                btn.setStyleSheet(
+                    "QPushButton { background-color: #e2e8f0; color: #475569;"
+                    "border: none; border-radius: 4px; }"
+                    "QPushButton:hover { background-color: #cbd5e1; }")
 
     def speak_message(self):
         """Triggers asynchronous offline TTS speech for the composed text."""
@@ -2243,6 +2369,8 @@ class BCICommunicationBoard(QMainWindow):
         if token == "FLIP OVER":
             self.current_board_name = "PHRASES" if self.current_board_name == "ALPHA" else "ALPHA"
             self.current_matrix = self.boards[self.current_board_name]
+            self.scanning_state = self.SCAN_ROWS
+            self.active_col = 0
             self.build_board_grid()
             self.update_ui_highlights()
             self.update_status_bar()

@@ -163,6 +163,16 @@ the headset picker, the per-headset sensor map or the translation.
 * **Facial EMG Expressions (`fac`):** Dual-mapped backup input processing using `Teeth Clench` (Select) and `Brow Furrow / Frown` (Speed Change).
 * **Independent Stream Toggles:** Easily enable or disable mental commands or facial expressions independently via bottom checkboxes.
 
+### Backing Out of a Wrong Row
+* Once a row is selected, a **CANCEL** cell appears at the end of it and is the last thing each sweep offers.
+* Selecting it returns to row scanning **on the same row** — the row that was actually wanted is usually next to the one that was hit — and says nothing.
+* A carer can also click it. Before this, the only ways out of a wrong row were to sit through every cell in it, or to select something wrong on purpose and delete it afterwards.
+
+### Scan Speed
+* **Five speeds, slowest first:** VERY SLOW (3.0s), SLOW (2.0s), MEDIUM (1.5s), FAST (1.0s), VERY FAST (0.6s).
+* **Click any of them** in the status bar to go straight to that speed — the mapped mental command and the `S` key still cycle through them one at a time.
+* The choice is remembered between sessions, because the right speed belongs to the person using the board, not to one run of the app.
+
 ### Real-time Hardware Tuning Bay
 * **Thought Sensitivity Slider:** Adjustable trigger activation threshold (0.05 to 0.95, default `0.35`).
 * **Facial EMG Sensitivity Slider:** Adjustable trigger activation threshold (0.05 to 0.95, default `0.70`).

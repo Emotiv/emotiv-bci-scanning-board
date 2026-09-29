@@ -136,6 +136,7 @@ STRINGS = {
         "board.mental_sens": "Mental Cmd Sens: {value}",
         "board.facial_sens": "Facial Sens: {value}",
         "board.cooldown": "Cooldown: {value}s",
+        "speed.very_slow": "VERY SLOW",
         "speed.slow": "SLOW",
         "speed.medium": "MEDIUM",
         "speed.fast": "FAST",
@@ -168,6 +169,7 @@ STRINGS = {
         "action.speed_short": "SPEED",
         "phase.row_locked": "ROW LOCKED",
         "phase.selection_complete": "SELECTION COMPLETE",
+        "phase.cancelled": "ROW CANCELLED",
 
         # ── quality pill, live on the board screen ────────────────────────
         "pill.contact": "Contact {percent}%",
@@ -203,6 +205,7 @@ STRINGS = {
         "cell.PAUSE SCANNER": "PAUSE SCANNER",
         "cell.CLEAR MESSAGE": "CLEAR MESSAGE",
         "cell.FLIP OVER": "FLIP OVER",
+        "cell.CANCEL": "CANCEL",
         "cell.I HAVE TO TELL YOU SOMETHING": "I HAVE TO TELL YOU SOMETHING",
         "cell.I LOVE YOU": "I LOVE YOU",
         "cell.YOU'RE WELCOME": "YOU'RE WELCOME",
@@ -373,6 +376,7 @@ STRINGS = {
         "board.mental_sens": "意念灵敏度：{value}",
         "board.facial_sens": "面部灵敏度：{value}",
         "board.cooldown": "冷却时间：{value} 秒",
+        "speed.very_slow": "很慢",
         "speed.slow": "慢",
         "speed.medium": "中",
         "speed.fast": "快",
@@ -402,6 +406,7 @@ STRINGS = {
         "action.speed_short": "调速",
         "phase.row_locked": "已锁定该行",
         "phase.selection_complete": "选择完成",
+        "phase.cancelled": "已取消该行",
 
         "pill.contact": "接触 {percent}%",
         "pill.eeg": "脑电 {percent}%",
@@ -434,6 +439,7 @@ STRINGS = {
         "cell.PAUSE SCANNER": "暂停扫描",
         "cell.CLEAR MESSAGE": "清空",
         "cell.FLIP OVER": "切换面板",
+        "cell.CANCEL": "取消",
         "cell.I HAVE TO TELL YOU SOMETHING": "我有话要说",
         "cell.I LOVE YOU": "我爱你",
         "cell.YOU'RE WELCOME": "不客气",
